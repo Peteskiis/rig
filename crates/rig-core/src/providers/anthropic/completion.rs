@@ -221,12 +221,21 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
             // Anthropic documents empty `end_turn` responses after tool-result round trips.
             // The generic completion response still requires at least one assistant item, so
             // normalize that terminal no-op into the same empty-text sentinel used by streaming.
-            if response.stop_reason.as_deref() == Some("end_turn") {
-                OneOrMany::one(completion::AssistantContent::text(""))
-            } else {
-                return Err(CompletionError::ResponseError(
-                    EMPTY_RESPONSE_ERROR.to_owned(),
-                ));
+            //
+            // `max_tokens` with empty content is the documented response shape for cache
+            // pre-warming requests (`max_tokens: 0`) — Anthropic returns no content but
+            // populates `usage.cache_creation_input_tokens` so callers can verify the cache
+            // write. Treat it identically to `end_turn`: empty-text sentinel + usage flows
+            // through, rather than discarding the body via `EMPTY_RESPONSE_ERROR`.
+            match response.stop_reason.as_deref() {
+                Some("end_turn") | Some("max_tokens") => {
+                    OneOrMany::one(completion::AssistantContent::text(""))
+                }
+                _ => {
+                    return Err(CompletionError::ResponseError(
+                        EMPTY_RESPONSE_ERROR.to_owned(),
+                    ));
+                }
             }
         } else {
             OneOrMany::many(content)

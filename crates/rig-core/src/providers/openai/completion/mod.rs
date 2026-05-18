@@ -44,6 +44,9 @@ where
 /// `gpt-5.5` completion model
 pub const GPT_5_5: &str = "gpt-5.5";
 
+/// `gpt-5.4` completion model
+pub const GPT_5_4: &str = "gpt-5.4";
+
 /// `gpt-5.2` completion model
 pub const GPT_5_2: &str = "gpt-5.2";
 

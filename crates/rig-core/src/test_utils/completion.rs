@@ -435,6 +435,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_yields_scripted_reasoning_events() {
+        use crate::message::ReasoningContent;
+
+        let model = MockCompletionModel::from_stream_turns([[
+            MockStreamEvent::reasoning_delta("thinking"),
+            MockStreamEvent::reasoning(ReasoningContent::Text {
+                text: "thinking".to_string(),
+                signature: Some("sig".to_string()),
+            })
+            .with_reasoning_id("rs_1"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+
+        let mut stream = model
+            .stream(request("reason"))
+            .await
+            .expect("stream should be created");
+
+        let mut saw_delta = false;
+        let mut saw_recap = false;
+        while let Some(item) = stream.next().await {
+            match item.expect("stream event should succeed") {
+                StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
+                    saw_delta = reasoning == "thinking";
+                }
+                StreamedAssistantContent::Reasoning(r) => {
+                    saw_recap = r.id.as_deref() == Some("rs_1")
+                        && matches!(
+                            r.content.first(),
+                            Some(ReasoningContent::Text { signature: Some(s), .. }) if s == "sig"
+                        );
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_delta, "reasoning delta must surface");
+        assert!(
+            saw_recap,
+            "reasoning recap must surface with id + signature"
+        );
+    }
+
+    #[tokio::test]
     async fn stream_error_event_is_returned() {
         let model = MockCompletionModel::from_stream_turns([[MockStreamEvent::error("boom")]]);
         let mut stream = model

@@ -2,6 +2,7 @@
 
 use crate::{
     completion::{CompletionError, GetTokenUsage, Usage},
+    message::ReasoningContent,
     streaming::{RawStreamingChoice, RawStreamingToolCall, ToolCallDeltaContent},
 };
 use serde::{Deserialize, Serialize};
@@ -54,6 +55,16 @@ pub enum MockStreamEvent {
         id: String,
         internal_call_id: String,
         content: ToolCallDeltaContent,
+    },
+    /// Complete reasoning content block (a provider "recap" item).
+    Reasoning {
+        id: Option<String>,
+        content: ReasoningContent,
+    },
+    /// Partial reasoning text delta.
+    ReasoningDelta {
+        id: Option<String>,
+        reasoning: String,
     },
     /// Provider-assigned message ID.
     MessageId(String),
@@ -119,6 +130,32 @@ impl MockStreamEvent {
         }
     }
 
+    /// Create a complete reasoning content block (a provider "recap" item),
+    /// without a provider id. Use [`Self::with_reasoning_id`] to attach one
+    /// (the `OpenAI` Responses path emits N same-id items per phase).
+    pub fn reasoning(content: ReasoningContent) -> Self {
+        Self::Reasoning { id: None, content }
+    }
+
+    /// Attach a provider reasoning-block id to a reasoning event.
+    pub fn with_reasoning_id(mut self, reasoning_id: impl Into<String>) -> Self {
+        match &mut self {
+            Self::Reasoning { id, .. } | Self::ReasoningDelta { id, .. } => {
+                *id = Some(reasoning_id.into());
+            }
+            _ => {}
+        }
+        self
+    }
+
+    /// Create a partial reasoning text delta, without a provider id.
+    pub fn reasoning_delta(reasoning: impl Into<String>) -> Self {
+        Self::ReasoningDelta {
+            id: None,
+            reasoning: reasoning.into(),
+        }
+    }
+
     /// Create a provider-assigned message ID event.
     pub fn message_id(id: impl Into<String>) -> Self {
         Self::MessageId(id.into())
@@ -170,6 +207,10 @@ impl MockStreamEvent {
                 internal_call_id,
                 content,
             }),
+            Self::Reasoning { id, content } => Ok(RawStreamingChoice::Reasoning { id, content }),
+            Self::ReasoningDelta { id, reasoning } => {
+                Ok(RawStreamingChoice::ReasoningDelta { id, reasoning })
+            }
             Self::MessageId(id) => Ok(RawStreamingChoice::MessageId(id)),
             Self::FinalResponse(response) => Ok(RawStreamingChoice::FinalResponse(response)),
             Self::Error(error) => Err(error.into_completion_error()),

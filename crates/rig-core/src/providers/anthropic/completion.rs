@@ -29,6 +29,8 @@ pub const CLAUDE_OPUS_4_7: &str = "claude-opus-4-7";
 pub const CLAUDE_SONNET_4_6: &str = "claude-sonnet-4-6";
 /// `claude-haiku-4-5` completion model
 pub const CLAUDE_HAIKU_4_5: &str = "claude-haiku-4-5";
+/// `claude-fable-5` completion model
+pub const CLAUDE_FABLE_5: &str = "claude-fable-5";
 
 pub const ANTHROPIC_VERSION_2023_01_01: &str = "2023-01-01";
 pub const ANTHROPIC_VERSION_2023_06_01: &str = "2023-06-01";

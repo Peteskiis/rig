@@ -578,7 +578,7 @@ fn is_false(value: &bool) -> bool {
 }
 
 impl ResponsesToolDefinition {
-    /// Creates a function tool definition.
+    /// Creates a function tool definition (strict mode).
     pub fn function(
         name: impl Into<String>,
         description: impl Into<String>,
@@ -591,6 +591,35 @@ impl ResponsesToolDefinition {
             name: name.into(),
             parameters,
             strict: true,
+            description: description.into(),
+            config: Map::new(),
+        }
+    }
+
+    /// Creates a **non-strict** function tool definition (cluster gateway
+    /// patch, agent-api#133). Used by the high-level `From<ToolDefinition>`
+    /// path: a gateway proxying arbitrary client/MCP tools can't know the
+    /// client wants OpenAI strict tool calling, and forcing it (via
+    /// `sanitize_schema`'s `required` = all-properties + `additionalProperties:
+    /// false` rewrites) makes OpenAI 400 any valid-but-non-strict schema (open
+    /// maps, property-less objects). `strict: false` + the lenient sanitize let
+    /// OpenAI's non-strict validation accept those. (`strict: false` is omitted
+    /// on the wire via the field's `skip_serializing_if = "is_false"`, so
+    /// acceptance rides on OpenAI's documented omitted-strict fallback — flip the
+    /// serde attr if that fallback ever changes.) Crate-internal: the only caller
+    /// is the `From<ToolDefinition>` impl below.
+    pub(crate) fn function_lenient(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        mut parameters: serde_json::Value,
+    ) -> Self {
+        super::sanitize_schema_lenient(&mut parameters);
+
+        Self {
+            kind: "function".to_string(),
+            name: name.into(),
+            parameters,
+            strict: false,
             description: description.into(),
             config: Map::new(),
         }
@@ -646,7 +675,9 @@ impl From<completion::ToolDefinition> for ResponsesToolDefinition {
             description,
         } = value;
 
-        Self::function(name, description, parameters)
+        // Non-strict: this is the high-level completion path (a gateway
+        // proxying arbitrary tools). See `function_lenient` (agent-api#133).
+        Self::function_lenient(name, description, parameters)
     }
 }
 
@@ -1929,6 +1960,45 @@ mod tests {
     use super::*;
     use crate::message;
     use serde_json::json;
+
+    #[test]
+    fn proxied_tool_def_is_non_strict_and_preserves_open_map() {
+        // agent-api#133 wire guard: the high-level `From<ToolDefinition>` path
+        // (what a gateway uses for every proxied client/MCP tool) must NOT force
+        // OpenAI strict mode. The other #133 tests exercise `sanitize_schema_lenient`
+        // directly; this one pins the WIRING — a future refactor routing proxied
+        // tools through `normalize()` (which re-stricts) would silently break this
+        // and still pass every hermetic test, leaving only the live e2e to catch it.
+        let tool = completion::ToolDefinition {
+            name: "browser_drop".to_string(),
+            description: "Drop a payload of MIME→string data onto a target.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "target": { "type": "string" },
+                    // Open string-map: valid JSON Schema, NOT strict-expressible.
+                    "data": { "type": "object", "additionalProperties": { "type": "string" } }
+                },
+                "required": ["target"]
+            }),
+        };
+
+        let responses_tool: ResponsesToolDefinition = tool.into();
+
+        // 1) Non-strict — OpenAI's lenient validation applies (and `strict: false`
+        //    is omitted on the wire via the struct's `skip_serializing_if`).
+        assert!(
+            !responses_tool.strict,
+            "proxied tools must not force strict mode"
+        );
+        // 2) The open map survived (lenient sanitize didn't clobber it).
+        assert_eq!(
+            responses_tool.parameters["properties"]["data"]["additionalProperties"],
+            json!({ "type": "string" })
+        );
+        // 3) `required` was NOT rewritten to every key — `data` stays optional.
+        assert_eq!(responses_tool.parameters["required"], json!(["target"]));
+    }
 
     fn response_with_service_tier(service_tier: &str) -> Value {
         json!({

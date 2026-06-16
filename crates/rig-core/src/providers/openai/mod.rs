@@ -34,12 +34,11 @@ pub use completion::*;
 pub use embedding::*;
 pub use model_listing::*;
 
-/// Recursively ensures all object schemas in a JSON schema respect OpenAI structured output restrictions.
-/// Nested arrays, schema $defs, object properties and enums should be handled through this method
 /// Sanitize a JSON schema for OpenAI's **strict** mode (structured outputs,
 /// which OpenAI requires to be strict): forces `additionalProperties: false`
 /// and `required` = every property, on top of the always-on cleanup (`$ref`
-/// sibling-strip, `oneOf`→`anyOf`, recursion).
+/// sibling-strip, `oneOf`→`anyOf`, recursion into `$defs`/properties/items/
+/// `anyOf`/`oneOf`/`allOf`).
 pub(crate) fn sanitize_schema(schema: &mut serde_json::Value) {
     sanitize_schema_impl(schema, true);
 }
@@ -56,6 +55,10 @@ pub(crate) fn sanitize_schema_lenient(schema: &mut serde_json::Value) {
     sanitize_schema_impl(schema, false);
 }
 
+/// Shared body for [`sanitize_schema`] / [`sanitize_schema_lenient`]. When
+/// `strict` is true it adds the two strict-mode rewrites (`additionalProperties:
+/// false` + `required` = all properties); when false those are skipped and only
+/// the benign cleanup runs. Recurses with the same `strict` flag.
 fn sanitize_schema_impl(schema: &mut serde_json::Value, strict: bool) {
     use serde_json::Value;
 

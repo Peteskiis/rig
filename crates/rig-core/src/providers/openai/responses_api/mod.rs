@@ -578,7 +578,7 @@ fn is_false(value: &bool) -> bool {
 }
 
 impl ResponsesToolDefinition {
-    /// Creates a function tool definition.
+    /// Creates a function tool definition (strict mode).
     pub fn function(
         name: impl Into<String>,
         description: impl Into<String>,
@@ -591,6 +591,31 @@ impl ResponsesToolDefinition {
             name: name.into(),
             parameters,
             strict: true,
+            description: description.into(),
+            config: Map::new(),
+        }
+    }
+
+    /// Creates a **non-strict** function tool definition (cluster gateway
+    /// patch, agent-api#133). Used by the high-level `From<ToolDefinition>`
+    /// path: a gateway proxying arbitrary client/MCP tools can't know the
+    /// client wants OpenAI strict tool calling, and forcing it (via
+    /// `sanitize_schema`'s `required` = all-properties + `additionalProperties:
+    /// false` rewrites) makes OpenAI 400 any valid-but-non-strict schema (open
+    /// maps, property-less objects). `strict: false` + the lenient sanitize let
+    /// OpenAI's non-strict validation accept those.
+    pub fn function_lenient(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        mut parameters: serde_json::Value,
+    ) -> Self {
+        super::sanitize_schema_lenient(&mut parameters);
+
+        Self {
+            kind: "function".to_string(),
+            name: name.into(),
+            parameters,
+            strict: false,
             description: description.into(),
             config: Map::new(),
         }
@@ -646,7 +671,9 @@ impl From<completion::ToolDefinition> for ResponsesToolDefinition {
             description,
         } = value;
 
-        Self::function(name, description, parameters)
+        // Non-strict: this is the high-level completion path (a gateway
+        // proxying arbitrary tools). See `function_lenient` (agent-api#133).
+        Self::function_lenient(name, description, parameters)
     }
 }
 

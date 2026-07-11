@@ -1276,6 +1276,7 @@ pub enum ReasoningEffort {
     Medium,
     High,
     Xhigh,
+    Max,
 }
 
 /// The amount of effort that will go into a reasoning summary by a given model.
@@ -2074,6 +2075,18 @@ mod tests {
             ))
             .expect("provider-specific service tier should serialize"),
             json!("provider_experimental")
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_max_round_trips() {
+        let effort: ReasoningEffort =
+            serde_json::from_value(json!("max")).expect("max effort should deserialize");
+
+        assert!(matches!(effort, ReasoningEffort::Max));
+        assert_eq!(
+            serde_json::to_value(effort).expect("max effort should serialize"),
+            json!("max")
         );
     }
 

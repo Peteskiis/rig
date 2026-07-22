@@ -571,6 +571,8 @@ pub enum VideoMediaType {
 pub enum ImageDetail {
     Low,
     High,
+    /// Preserve the source resolution when the provider supports it.
+    Original,
     #[default]
     Auto,
 }

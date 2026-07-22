@@ -228,9 +228,37 @@ pub struct ToolResult {
     /// The call ID of a tool (this should be linked to the call ID for a tool call, otherwise an error will be received)
     call_id: String,
     /// The result of a tool call.
-    output: String,
+    output: ToolResultOutput,
     /// The status of a tool call (if used in a completion request, this should always be Completed)
     status: ToolStatus,
+}
+
+/// Responses accepts either the legacy string output or typed input content.
+/// Typed content is required for model-visible image tool results.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(untagged)]
+enum ToolResultOutput {
+    Text(String),
+    Content(Vec<ToolResultOutputContent>),
+}
+
+impl From<String> for ToolResultOutput {
+    fn from(value: String) -> Self {
+        Self::Text(value)
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ToolResultOutputContent {
+    InputText {
+        text: String,
+    },
+    InputImage {
+        image_url: String,
+        #[serde(default)]
+        detail: ImageDetail,
+    },
 }
 
 impl From<Message> for InputItem {
@@ -265,7 +293,7 @@ impl From<Message> for InputItem {
                 role: None,
                 input: InputContent::FunctionCallOutput(ToolResult {
                     call_id: tool_call_id,
-                    output,
+                    output: output.into(),
                     status: ToolStatus::Completed,
                 }),
             },
@@ -306,25 +334,26 @@ impl TryFrom<crate::completion::Message> for Vec<InputItem> {
                                 ..
                             },
                         ) => {
-                            for tool_result_content in tool_content {
-                                let crate::completion::message::ToolResultContent::Text(Text {
-                                    text,
-                                }) = tool_result_content
-                                else {
-                                    return Err(CompletionError::ProviderError(
-                                        "This thing only supports text!".to_string(),
-                                    ));
-                                };
-                                // let output = serde_json::from_str(&text)?;
-                                items.push(InputItem {
-                                    role: None,
-                                    input: InputContent::FunctionCallOutput(ToolResult {
-                                        call_id: require_call_id(call_id.clone(), "Tool result")?,
-                                        output: text,
-                                        status: ToolStatus::Completed,
-                                    }),
+                            let mut output = Vec::new();
+                            for content in tool_content {
+                                output.push(match content {
+                                    crate::completion::message::ToolResultContent::Text(Text {
+                                        text,
+                                    }) => ToolResultOutputContent::InputText { text },
+                                    crate::completion::message::ToolResultContent::Image(image) => {
+                                        let (image_url, detail) = openai_image(image)?;
+                                        ToolResultOutputContent::InputImage { image_url, detail }
+                                    }
                                 });
                             }
+                            items.push(InputItem {
+                                role: None,
+                                input: InputContent::FunctionCallOutput(ToolResult {
+                                    call_id: require_call_id(call_id, "Tool result")?,
+                                    output: ToolResultOutput::Content(output),
+                                    status: ToolStatus::Completed,
+                                }),
+                            });
                         }
                         crate::message::UserContent::Document(Document {
                             data: DocumentSourceKind::FileId(file_id),
@@ -497,6 +526,35 @@ impl TryFrom<crate::completion::Message> for Vec<InputItem> {
             }
         }
     }
+}
+
+fn openai_image(image: crate::message::Image) -> Result<(String, ImageDetail), CompletionError> {
+    let crate::message::Image {
+        data,
+        media_type,
+        detail,
+        ..
+    } = image;
+    let image_url = match data {
+        DocumentSourceKind::Base64(data) => {
+            let media_type = media_type
+                .map(|media_type| media_type.to_mime_type().to_string())
+                .unwrap_or_default();
+            format!("data:{media_type};base64,{data}")
+        }
+        DocumentSourceKind::Url(url) => url,
+        DocumentSourceKind::Raw(_) => {
+            return Err(CompletionError::RequestError(
+                "Raw image data not supported, encode as base64 first".into(),
+            ));
+        }
+        source => {
+            return Err(CompletionError::RequestError(
+                format!("Unsupported image source: {source}").into(),
+            ));
+        }
+    };
+    Ok((image_url, detail.unwrap_or_default()))
 }
 
 impl From<OneOrMany<String>> for Vec<ReasoningSummary> {
@@ -2153,5 +2211,44 @@ mod tests {
         assert_eq!(json["content"][0]["file_id"], "file_abc");
         assert!(json["content"][0].get("file_data").is_none());
         assert!(json["content"][0].get("file_url").is_none());
+    }
+
+    #[test]
+    fn image_tool_result_serializes_as_one_typed_function_output() {
+        let content = OneOrMany::many(vec![
+            completion::message::ToolResultContent::text("preview"),
+            completion::message::ToolResultContent::image_base64(
+                "aGVsbG8=",
+                Some(message::ImageMediaType::PNG),
+                Some(ImageDetail::High),
+            ),
+        ])
+        .expect("non-empty tool result");
+        let message = completion::Message::User {
+            content: OneOrMany::one(message::UserContent::tool_result_with_call_id(
+                "fc_1",
+                "call_1".to_owned(),
+                content,
+            )),
+        };
+
+        let converted: Vec<InputItem> = message.try_into().expect("conversion should succeed");
+        assert_eq!(converted.len(), 1, "one function call output per call id");
+        let json = serde_json::to_value(&converted[0]).expect("serialize input item");
+
+        assert_eq!(json["type"], "function_call_output");
+        assert_eq!(json["call_id"], "call_1");
+        assert_eq!(
+            json["output"][0],
+            json!({"type": "input_text", "text": "preview"})
+        );
+        assert_eq!(
+            json["output"][1],
+            json!({
+                "type": "input_image",
+                "image_url": "data:image/png;base64,aGVsbG8=",
+                "detail": "high"
+            })
+        );
     }
 }

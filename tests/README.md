@@ -128,6 +128,9 @@ cargo test -p rig --features sqlite --test integrations sqlite -- --nocapture
 ```
 
 Some integration tests start Docker containers through `testcontainers`; Docker must be running.
+Their disposable data is tmpfs-backed where the image declares persistent
+storage, and the testcontainers watchdog removes containers when the test
+runner receives an interrupt or termination signal.
 Other integrations are ignored because they need external credentials or pre-provisioned services.
 Run ignored integration tests explicitly:
 

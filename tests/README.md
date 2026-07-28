@@ -27,7 +27,7 @@ cargo test -p rig
 Run the same checks with all root crate features enabled:
 
 ```bash
-cargo test -p rig --all-features
+./scripts/test-rig.sh --all-features
 ```
 
 ## Cassette Provider Tests
@@ -116,7 +116,7 @@ feature flags.
 Run all enabled non-ignored integration tests with:
 
 ```bash
-cargo test -p rig --all-features --test integrations
+./scripts/test-rig.sh --all-features --test integrations
 ```
 
 Run one feature-gated integration group with:

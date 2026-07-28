@@ -28,6 +28,12 @@ The root `rig` crate re-exports `rig-core` and exposes companion crates behind
 feature flags. Check `Cargo.toml` before documenting or changing exposed
 features, integrations, or module paths.
 
+Run the Docker-backed PostgreSQL integration test through
+`scripts/test-postgres-integration.sh`. It removes only aged
+`rig-postgres` containers whose labelled runner PID has exited before starting
+the test; pgdata remains tmpfs-backed and the testcontainers watchdog handles
+catchable termination signals.
+
 ## Core Architecture
 
 Rig is built around provider-agnostic traits:

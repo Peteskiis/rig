@@ -27,7 +27,7 @@ cargo test -p rig
 Run the same checks with all root crate features enabled:
 
 ```bash
-cargo test -p rig --all-features
+./scripts/test-rig.sh --all-features
 ```
 
 ## Cassette Provider Tests
@@ -116,7 +116,7 @@ feature flags.
 Run all enabled non-ignored integration tests with:
 
 ```bash
-cargo test -p rig --all-features --test integrations
+./scripts/test-rig.sh --all-features --test integrations
 ```
 
 Run one feature-gated integration group with:
@@ -125,9 +125,15 @@ Run one feature-gated integration group with:
 cargo test -p rig --features qdrant --test integrations qdrant -- --nocapture
 cargo test -p rig --features mongodb --test integrations mongodb -- --nocapture
 cargo test -p rig --features sqlite --test integrations sqlite -- --nocapture
+./scripts/test-postgres-integration.sh
 ```
 
 Some integration tests start Docker containers through `testcontainers`; Docker must be running.
+Their disposable data is tmpfs-backed where the image declares persistent
+storage, and the testcontainers watchdog removes containers when the test
+runner receives an interrupt or termination signal. The PostgreSQL wrapper also
+removes aged `rig-postgres` containers when their owning test runner has exited,
+covering uncatchable runner failures such as SIGKILL or OOM.
 Other integrations are ignored because they need external credentials or pre-provisioned services.
 Run ignored integration tests explicitly:
 

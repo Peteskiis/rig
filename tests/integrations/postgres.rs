@@ -20,11 +20,13 @@ use serde_json::json;
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use testcontainers::{
     ContainerAsync, GenericImage, ImageExt,
-    core::{IntoContainerPort, WaitFor},
+    core::{IntoContainerPort, Mount, WaitFor},
     runners::AsyncRunner,
 };
 
 const POSTGRES_PORT: u16 = 5432;
+const TEST_SUITE_LABEL: &str = "com.cluster.test-suite";
+const TEST_RUNNER_PID_LABEL: &str = "com.cluster.test-runner-pid";
 
 fn skip_if_docker_unavailable(test_name: &str) -> bool {
     let docker_socket = std::path::Path::new("/var/run/docker.sock");
@@ -175,6 +177,9 @@ async fn start_container() -> ContainerAsync<GenericImage> {
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_env_var("POSTGRES_DB", "rig")
+        .with_label(TEST_SUITE_LABEL, "rig-postgres")
+        .with_label(TEST_RUNNER_PID_LABEL, std::process::id().to_string())
+        .with_mount(Mount::tmpfs_mount("/var/lib/postgresql/data"))
         .start()
         .await
         .expect("Failed to start postgres with pgvector container")

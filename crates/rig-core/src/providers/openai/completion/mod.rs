@@ -506,12 +506,11 @@ impl TryFrom<message::UserContent> for UserContent {
                         data
                     );
 
-                    let detail = detail.ok_or(message::MessageError::ConversionError(
-                        "OpenAI image URI must have image detail".into(),
-                    ))?;
-
                     Ok(UserContent::Image {
-                        image_url: ImageUrl { url, detail },
+                        image_url: ImageUrl {
+                            url,
+                            detail: detail.unwrap_or_default(),
+                        },
                     })
                 }
                 DocumentSourceKind::Raw(_) => Err(message::MessageError::ConversionError(
@@ -2102,6 +2101,25 @@ mod tests {
         );
         assert_eq!(json["file"]["filename"], "document.pdf");
         assert!(json["file"].get("file_id").is_none());
+    }
+
+    #[test]
+    fn base64_image_without_detail_defaults_to_auto() {
+        let image = message::UserContent::image_base64(
+            "base64-jpeg-data",
+            Some(message::ImageMediaType::JPEG),
+            None,
+        );
+
+        let converted: UserContent = image.try_into().expect("conversion should succeed");
+        let json = serde_json::to_value(&converted).expect("serialize");
+
+        assert_eq!(json["type"], "image_url");
+        assert_eq!(
+            json["image_url"]["url"],
+            "data:image/jpeg;base64,base64-jpeg-data"
+        );
+        assert_eq!(json["image_url"]["detail"], "auto");
     }
 
     #[test]

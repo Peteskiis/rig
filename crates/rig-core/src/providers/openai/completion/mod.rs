@@ -1144,6 +1144,19 @@ pub struct GenericCompletionModel<Ext = super::OpenAICompletionsExt, H = reqwest
 pub type CompletionModel<H = reqwest::Client> =
     GenericCompletionModel<super::OpenAICompletionsExt, H>;
 
+/// Provider-specific metadata for APIs that reuse OpenAI Chat Completions wire types.
+///
+/// Compatible providers share request, response, and streaming conversion while keeping
+/// their telemetry identity accurate.
+pub trait OpenAICompatibleProvider: crate::client::Provider {
+    /// GenAI semantic-convention provider name recorded on completion spans.
+    const PROVIDER_NAME: &'static str;
+}
+
+impl OpenAICompatibleProvider for super::OpenAICompletionsExt {
+    const PROVIDER_NAME: &'static str = "openai";
+}
+
 impl<Ext, H> GenericCompletionModel<Ext, H>
 where
     crate::client::Client<Ext, H>: std::fmt::Debug + Clone + 'static,
@@ -1393,7 +1406,7 @@ impl<Ext, H> completion::CompletionModel for GenericCompletionModel<Ext, H>
 where
     crate::client::Client<Ext, H>:
         HttpClientExt + Clone + WasmCompatSend + WasmCompatSync + 'static,
-    Ext: crate::client::Provider
+    Ext: OpenAICompatibleProvider
         + crate::client::DebugExt
         + Clone
         + WasmCompatSend
@@ -1419,7 +1432,7 @@ where
                 target: "rig::completions",
                 "chat",
                 gen_ai.operation.name = "chat",
-                gen_ai.provider.name = "openai",
+                gen_ai.provider.name = Ext::PROVIDER_NAME,
                 gen_ai.request.model = self.model,
                 gen_ai.system_instructions = &completion_request.preamble,
                 gen_ai.response.id = tracing::field::Empty,

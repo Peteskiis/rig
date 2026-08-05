@@ -10,7 +10,9 @@ use crate::providers::internal::openai_chat_completions_compatible::{
     self, CompatibleChoiceData, CompatibleChunk, CompatibleFinishReason, CompatibleStreamProfile,
     CompatibleToolCallChunk,
 };
-use crate::providers::openai::completion::{GenericCompletionModel, OpenAIRequestParams, Usage};
+use crate::providers::openai::completion::{
+    GenericCompletionModel, OpenAICompatibleProvider, OpenAIRequestParams, Usage,
+};
 use crate::streaming;
 
 // ================================================================
@@ -89,7 +91,7 @@ impl GetTokenUsage for StreamingCompletionResponse {
 impl<Ext, H> GenericCompletionModel<Ext, H>
 where
     crate::client::Client<Ext, H>: HttpClientExt + Clone + 'static,
-    Ext: crate::client::Provider + Clone + 'static,
+    Ext: OpenAICompatibleProvider + Clone + 'static,
 {
     pub(crate) async fn stream(
         &self,
@@ -131,7 +133,7 @@ where
                 target: "rig::completions",
                 "chat",
                 gen_ai.operation.name = "chat",
-                gen_ai.provider.name = "openai",
+                gen_ai.provider.name = Ext::PROVIDER_NAME,
                 gen_ai.request.model = self.model,
                 gen_ai.response.id = tracing::field::Empty,
                 gen_ai.response.model = tracing::field::Empty,

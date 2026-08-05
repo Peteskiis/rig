@@ -514,14 +514,13 @@ mod tests {
             .body(Vec::new())
             .unwrap();
 
-        let events = send_compatible_streaming_request(client, req)
+        let mut stream = send_compatible_streaming_request(client, req)
             .await
-            .unwrap()
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()
             .unwrap();
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            events.push(event.unwrap());
+        }
 
         assert!(matches!(
             events.first(),
@@ -558,6 +557,22 @@ mod tests {
             1,
             "reasoning deltas must close into exactly one terminal block"
         );
+
+        let choice = stream.choice.iter().collect::<Vec<_>>();
+        assert_eq!(choice.len(), 2);
+        assert!(matches!(
+            choice.first(),
+            Some(crate::message::AssistantContent::Reasoning(reasoning))
+                if reasoning.content == vec![ReasoningContent::Text {
+                    text: "Check the weather.".to_string(),
+                    signature: None,
+                }]
+        ));
+        assert!(matches!(
+            choice.get(1),
+            Some(crate::message::AssistantContent::ToolCall(tool_call))
+                if tool_call.id == "call_weather"
+        ));
     }
 
     /// Reproduces the bug where a proxy/gateway sends multiple parallel tool

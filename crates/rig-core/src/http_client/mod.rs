@@ -3,6 +3,7 @@ use bytes::Bytes;
 pub use http::{HeaderMap, HeaderValue, Method, Request, Response, Uri, request::Builder};
 use http::{HeaderName, StatusCode};
 use reqwest::Body;
+use std::fmt;
 pub mod multipart;
 pub mod retry;
 pub mod sse;
@@ -14,7 +15,7 @@ use std::pin::Pin;
 
 const MAX_ERROR_MESSAGE_BYTES: usize = 8 * 1024;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum Error {
     #[error("Http error: {0}")]
     Protocol(#[from] http::Error),
@@ -22,10 +23,14 @@ pub enum Error {
     InvalidStatusCode(StatusCode),
     #[error("Invalid status code {0} with message: {1}")]
     InvalidStatusCodeWithMessage(StatusCode, String),
+    /// A non-success response returned by an upstream service.
     #[error("upstream returned HTTP {status}")]
     Status {
+        /// The upstream HTTP response status.
         status: StatusCode,
+        /// Numeric `Retry-After` delay, when supplied by the upstream service.
         retry_after_secs: Option<u64>,
+        /// A bounded response-body preview for structured error handling.
         message: String,
     },
     #[error("Header value outside of legal range: {0}")]
@@ -43,6 +48,44 @@ pub enum Error {
     #[cfg(target_family = "wasm")]
     #[error("Http client error: {0}")]
     Instance(#[from] Box<dyn std::error::Error + 'static>),
+}
+
+impl fmt::Debug for Error {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Protocol(error) => formatter.debug_tuple("Protocol").field(error).finish(),
+            Self::InvalidStatusCode(status) => formatter
+                .debug_tuple("InvalidStatusCode")
+                .field(status)
+                .finish(),
+            Self::InvalidStatusCodeWithMessage(status, message) => formatter
+                .debug_tuple("InvalidStatusCodeWithMessage")
+                .field(status)
+                .field(message)
+                .finish(),
+            Self::Status {
+                status,
+                retry_after_secs,
+                ..
+            } => formatter
+                .debug_struct("Status")
+                .field("status", status)
+                .field("retry_after_secs", retry_after_secs)
+                .field("message", &"<redacted>")
+                .finish(),
+            Self::InvalidHeaderValue(error) => formatter
+                .debug_tuple("InvalidHeaderValue")
+                .field(error)
+                .finish(),
+            Self::NoHeaders => formatter.write_str("NoHeaders"),
+            Self::StreamEnded => formatter.write_str("StreamEnded"),
+            Self::InvalidContentType(content_type) => formatter
+                .debug_tuple("InvalidContentType")
+                .field(content_type)
+                .finish(),
+            Self::Instance(error) => formatter.debug_tuple("Instance").field(error).finish(),
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

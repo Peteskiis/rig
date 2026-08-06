@@ -6,7 +6,7 @@ use crate::{
     OneOrMany,
     client::Provider,
     completion::{self, CompletionError, GetServiceTier, GetTokenUsage, ServiceTier},
-    http_client::HttpClientExt,
+    http_client::{self, HttpClientExt},
     message::{self, DocumentMediaType, DocumentSourceKind, MessageError, MimeType, Reasoning},
     one_or_many::string_or_one_or_many,
     telemetry::{ProviderResponseExt, SpanCombinator},
@@ -1517,6 +1517,20 @@ where
                 .await
                 .map_err(CompletionError::HttpError)?;
 
+            if !response.status().is_success() {
+                let status = response.status();
+                let headers = response.headers().clone();
+                let body = response
+                    .into_body()
+                    .await
+                    .map_err(CompletionError::HttpError)?;
+                return Err(CompletionError::HttpError(http_client::status_error(
+                    status,
+                    &headers,
+                    String::from_utf8_lossy(&body).into_owned(),
+                )));
+            }
+
             match serde_json::from_slice::<ApiResponse<CompletionResponse>>(
                 response
                     .into_body()
@@ -1625,6 +1639,35 @@ mod tests {
         format!("http://{address}")
     }
 
+    async fn chunked_status_server() -> String {
+        let app = Router::new().route(
+            "/v1/messages",
+            post(|| async {
+                let chunks = [
+                    Ok::<_, Infallible>(Bytes::from(vec![b'a'; 8_191])),
+                    Ok(Bytes::from_static("€tail".as_bytes())),
+                ];
+                let mut response =
+                    axum::response::Response::new(Body::from_stream(futures::stream::iter(chunks)));
+                *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+                response
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let address = listener
+            .local_addr()
+            .expect("test server should have a local address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should run");
+        });
+
+        format!("http://{address}")
+    }
+
     #[tokio::test]
     async fn anthropic_completion_preserves_rate_limit_status_and_retry_after() {
         let base_url = status_server(StatusCode::TOO_MANY_REQUESTS, Some("17")).await;
@@ -1641,6 +1684,9 @@ mod tests {
             .await
             .expect_err("rate-limit response should fail");
 
+        assert!(!format!("{error}").contains("fast limit reached"));
+        assert!(!format!("{error:?}").contains("fast limit reached"));
+
         match error {
             crate::completion::CompletionError::HttpError(http_client::Error::Status {
                 status,
@@ -1651,17 +1697,68 @@ mod tests {
                 assert_eq!(retry_after_secs, Some(17));
                 assert!(message.len() <= 8 * 1024);
                 assert!(message.contains("fast limit reached"));
-                assert!(
-                    !format!(
-                        "{}",
-                        http_client::Error::Status {
-                            status,
-                            retry_after_secs,
-                            message,
-                        }
-                    )
-                    .contains("fast limit reached")
-                );
+            }
+            other => panic!("expected structured HTTP error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_completion_rejects_non_success_response_from_custom_client() {
+        let http_client = crate::test_utils::RecordingHttpClient::with_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"type":"error","error":{"type":"rate_limit_error","message":"custom fast limit"}}"#,
+        );
+        let client = anthropic::Client::builder()
+            .http_client(http_client)
+            .api_key("test-key")
+            .build()
+            .expect("test client should build");
+        let model = client.completion_model(CLAUDE_SONNET_4_6);
+        let request = model.completion_request("hello").max_tokens(4).build();
+
+        let error = model
+            .completion(request)
+            .await
+            .expect_err("non-success custom response should fail as HTTP status");
+
+        match error {
+            crate::completion::CompletionError::HttpError(http_client::Error::Status {
+                status,
+                retry_after_secs,
+                message,
+            }) => {
+                assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+                assert_eq!(retry_after_secs, None);
+                assert!(message.contains("custom fast limit"));
+            }
+            other => panic!("expected structured HTTP error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_completion_bounds_chunked_utf8_status_body() {
+        let base_url = chunked_status_server().await;
+        let client = anthropic::Client::builder()
+            .api_key("test-key")
+            .base_url(base_url)
+            .build()
+            .expect("test client should build");
+        let model = client.completion_model(CLAUDE_SONNET_4_6);
+        let request = model.completion_request("hello").max_tokens(4).build();
+
+        let error = model
+            .completion(request)
+            .await
+            .expect_err("oversized status response should fail");
+
+        match error {
+            crate::completion::CompletionError::HttpError(http_client::Error::Status {
+                message,
+                ..
+            }) => {
+                assert!(message.is_char_boundary(message.len()));
+                assert!(message.len() <= 8 * 1024);
+                assert_eq!(message, "a".repeat(8_191));
             }
             other => panic!("expected structured HTTP error, got {other:?}"),
         }

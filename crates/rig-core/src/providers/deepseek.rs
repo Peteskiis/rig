@@ -849,6 +849,14 @@ where
                         message.as_bytes(),
                     )
                 }
+                http_client::Error::Status {
+                    status, message, ..
+                } => ModelListingError::api_error_with_context(
+                    "DeepSeek",
+                    path,
+                    status.as_u16(),
+                    message.as_bytes(),
+                ),
                 other => ModelListingError::from(other),
             })?;
 
@@ -1246,6 +1254,37 @@ mod tests {
                 assert!(message.contains("provider=DeepSeek"));
                 assert!(message.contains("path=/models"));
                 assert!(message.contains("invalid api key"));
+            }
+            other => panic!("expected api error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_models_preserves_structured_status_error_context() {
+        let http_client = RecordingHttpClient::with_status_error(
+            http::StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"message":"fast limit reached"}}"#,
+        );
+        let client = Client::builder()
+            .api_key("dummy-key")
+            .http_client(http_client)
+            .build()
+            .expect("client should build");
+
+        let error = client
+            .list_models()
+            .await
+            .expect_err("list_models should fail");
+
+        match error {
+            ModelListingError::ApiError {
+                status_code,
+                message,
+            } => {
+                assert_eq!(status_code, 429);
+                assert!(message.contains("provider=DeepSeek"));
+                assert!(message.contains("path=/models"));
+                assert!(message.contains("fast limit reached"));
             }
             other => panic!("expected api error, got {other:?}"),
         }

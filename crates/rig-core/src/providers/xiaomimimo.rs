@@ -320,6 +320,14 @@ where
                         message.as_bytes(),
                     )
                 }
+                http_client::Error::Status {
+                    status, message, ..
+                } => ModelListingError::api_error_with_context(
+                    "Xiaomi MiMo",
+                    path,
+                    status.as_u16(),
+                    message.as_bytes(),
+                ),
                 other => ModelListingError::from(other),
             })?;
 
@@ -348,9 +356,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        ANTHROPIC_API_BASE_URL, API_BASE_URL, normalize_anthropic_base_url,
+        ANTHROPIC_API_BASE_URL, API_BASE_URL, Client, normalize_anthropic_base_url,
         resolve_anthropic_base_override,
     };
+    use crate::client::ModelListingClient;
+    use crate::model::ModelListingError;
+    use crate::test_utils::RecordingHttpClient;
 
     #[test]
     fn test_client_initialization() {
@@ -400,5 +411,36 @@ mod tests {
             override_url.as_deref(),
             Some("https://primary.example.com/anthropic/v1")
         );
+    }
+
+    #[tokio::test]
+    async fn list_models_preserves_structured_status_error_context() {
+        let http_client = RecordingHttpClient::with_status_error(
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":{"message":"fast capacity unavailable"}}"#,
+        );
+        let client = Client::builder()
+            .api_key("dummy-key")
+            .http_client(http_client)
+            .build()
+            .expect("client should build");
+
+        let error = client
+            .list_models()
+            .await
+            .expect_err("list_models should fail");
+
+        match error {
+            ModelListingError::ApiError {
+                status_code,
+                message,
+            } => {
+                assert_eq!(status_code, 503);
+                assert!(message.contains("provider=Xiaomi MiMo"));
+                assert!(message.contains("path=/models"));
+                assert!(message.contains("fast capacity unavailable"));
+            }
+            other => panic!("expected api error, got {other:?}"),
+        }
     }
 }

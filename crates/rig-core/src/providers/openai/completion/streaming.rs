@@ -10,7 +10,9 @@ use crate::providers::internal::openai_chat_completions_compatible::{
     self, CompatibleChoiceData, CompatibleChunk, CompatibleFinishReason, CompatibleStreamProfile,
     CompatibleToolCallChunk,
 };
-use crate::providers::openai::completion::{GenericCompletionModel, OpenAIRequestParams, Usage};
+use crate::providers::openai::completion::{
+    GenericCompletionModel, OpenAICompatibleProvider, OpenAIRequestParams, Usage,
+};
 use crate::streaming;
 
 // ================================================================
@@ -89,7 +91,7 @@ impl GetTokenUsage for StreamingCompletionResponse {
 impl<Ext, H> GenericCompletionModel<Ext, H>
 where
     crate::client::Client<Ext, H>: HttpClientExt + Clone + 'static,
-    Ext: crate::client::Provider + Clone + 'static,
+    Ext: OpenAICompatibleProvider + Clone + 'static,
 {
     pub(crate) async fn stream(
         &self,
@@ -131,7 +133,7 @@ where
                 target: "rig::completions",
                 "chat",
                 gen_ai.operation.name = "chat",
-                gen_ai.provider.name = "openai",
+                gen_ai.provider.name = Ext::PROVIDER_NAME,
                 gen_ai.request.model = self.model,
                 gen_ai.response.id = tracing::field::Empty,
                 gen_ai.response.model = tracing::field::Empty,
@@ -485,6 +487,92 @@ mod tests {
         assert_eq!(core_usage.cached_input_tokens, 80);
         assert_eq!(core_usage.input_tokens, 100);
         assert_eq!(core_usage.total_tokens, 110);
+    }
+
+    #[tokio::test]
+    async fn test_reasoning_content_closes_before_tool_call() {
+        use crate::message::ReasoningContent;
+        use crate::test_utils::MockStreamingClient;
+        use futures::StreamExt;
+
+        // Fireworks Kimi K3 streams unsigned reasoning through the
+        // OpenAI-compatible `reasoning_content` extension before tool calls.
+        let client = MockStreamingClient {
+            sse_bytes: sse_bytes_from_data_lines([
+                "{\"choices\":[{\"delta\":{\"reasoning_content\":\"Check \"},\"finish_reason\":null}],\"usage\":null}",
+                "{\"choices\":[{\"delta\":{\"reasoning_content\":\"the weather.\"},\"finish_reason\":null}],\"usage\":null}",
+                "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_weather\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\"}}]},\"finish_reason\":null}],\"usage\":null}",
+                "{\"choices\":[{\"delta\":{\"tool_calls\":[]},\"finish_reason\":\"tool_calls\"}],\"usage\":null}",
+                "{\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}",
+                "[DONE]",
+            ]),
+        };
+
+        let req = http::Request::builder()
+            .method("POST")
+            .uri("http://localhost/v1/chat/completions")
+            .body(Vec::new())
+            .unwrap();
+
+        let mut stream = send_compatible_streaming_request(client, req)
+            .await
+            .unwrap();
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            events.push(event.unwrap());
+        }
+
+        assert!(matches!(
+            events.first(),
+            Some(streaming::StreamedAssistantContent::ReasoningDelta { reasoning, id: None })
+                if reasoning == "Check "
+        ));
+        assert!(matches!(
+            events.get(1),
+            Some(streaming::StreamedAssistantContent::ReasoningDelta { reasoning, id: None })
+                if reasoning == "the weather."
+        ));
+        assert!(matches!(
+            events.get(2),
+            Some(streaming::StreamedAssistantContent::Reasoning(reasoning))
+                if reasoning.id.is_none()
+                    && reasoning.content == vec![ReasoningContent::Text {
+                        text: "Check the weather.".to_string(),
+                        signature: None,
+                    }]
+        ));
+        assert!(matches!(
+            events.get(3),
+            Some(streaming::StreamedAssistantContent::ToolCallDelta {
+                content: streaming::ToolCallDeltaContent::Name(name),
+                ..
+            }) if name == "get_weather"
+        ));
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, streaming::StreamedAssistantContent::Reasoning(_)))
+                .count(),
+            1,
+            "reasoning deltas must close into exactly one terminal block"
+        );
+
+        let choice = stream.choice.iter().collect::<Vec<_>>();
+        assert_eq!(choice.len(), 2);
+        assert!(matches!(
+            choice.first(),
+            Some(crate::message::AssistantContent::Reasoning(reasoning))
+                if reasoning.content == vec![ReasoningContent::Text {
+                    text: "Check the weather.".to_string(),
+                    signature: None,
+                }]
+        ));
+        assert!(matches!(
+            choice.get(1),
+            Some(crate::message::AssistantContent::ToolCall(tool_call))
+                if tool_call.id == "call_weather"
+        ));
     }
 
     /// Reproduces the bug where a proxy/gateway sends multiple parallel tool

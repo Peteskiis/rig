@@ -62,6 +62,7 @@ Rig supports the following LLM providers out of the box:
 - ChatGPT and GitHub Copilot auth-backed clients
 - Cohere
 - DeepSeek
+- Fireworks AI
 - Galadriel
 - Gemini
 - Groq

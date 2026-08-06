@@ -5,6 +5,7 @@
 //! - ChatGPT and GitHub Copilot auth-backed clients
 //! - Cohere
 //! - DeepSeek
+//! - Fireworks AI
 //! - Galadriel
 //! - Gemini
 //! - Groq
@@ -69,6 +70,7 @@ pub mod chatgpt;
 pub mod cohere;
 pub mod copilot;
 pub mod deepseek;
+pub mod fireworks;
 pub mod galadriel;
 pub mod gemini;
 pub mod groq;

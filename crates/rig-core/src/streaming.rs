@@ -396,10 +396,16 @@ where
                     };
                     stream.text_item_index = None;
                     // Full reasoning block supersedes any delta accumulation
-                    stream.reasoning_item_index = None;
-                    stream
-                        .assistant_items
-                        .push(AssistantContent::Reasoning(reasoning.clone()));
+                    let aggregated = AssistantContent::Reasoning(reasoning.clone());
+                    if let Some(existing) = stream
+                        .reasoning_item_index
+                        .take()
+                        .and_then(|index| stream.assistant_items.get_mut(index))
+                    {
+                        *existing = aggregated;
+                    } else {
+                        stream.assistant_items.push(aggregated);
+                    }
                     Poll::Ready(Some(Ok(StreamedAssistantContent::Reasoning(reasoning))))
                 }
                 RawStreamingChoice::ReasoningDelta { id, reasoning } => {

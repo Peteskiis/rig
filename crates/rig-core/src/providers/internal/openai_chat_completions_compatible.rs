@@ -17,6 +17,7 @@ use crate::completion::{CompletionError, GetTokenUsage};
 use crate::http_client::HttpClientExt;
 use crate::http_client::sse::{Event, GenericEventSource};
 use crate::json_utils;
+use crate::message::ReasoningContent;
 use crate::streaming::{self, RawStreamingChoice, RawStreamingToolCall, ToolCallDeltaContent};
 use crate::wasm_compat::WasmCompatSend;
 
@@ -209,6 +210,7 @@ where
 
     let stream = stream! {
         let mut tool_calls: HashMap<usize, RawStreamingToolCall> = HashMap::new();
+        let mut pending_reasoning = String::new();
         let mut final_usage = None;
         let mut terminated_with_error = false;
 
@@ -247,7 +249,34 @@ where
                         continue;
                     };
 
-                    for incoming in choice.tool_calls {
+                    let CompatibleChoice {
+                        finish_reason,
+                        text,
+                        reasoning,
+                        tool_calls: incoming_tool_calls,
+                        details,
+                    } = choice;
+
+                    if let Some(reasoning) = reasoning
+                        && !reasoning.is_empty()
+                    {
+                        pending_reasoning.push_str(&reasoning);
+                        yield Ok(RawStreamingChoice::ReasoningDelta {
+                            id: None,
+                            reasoning,
+                        });
+                    }
+
+                    let closes_reasoning = !incoming_tool_calls.is_empty()
+                        || text.as_ref().is_some_and(|content| !content.is_empty())
+                        || finish_reason == CompatibleFinishReason::ToolCalls;
+                    if closes_reasoning
+                        && let Some(content) = take_pending_reasoning(&mut pending_reasoning)
+                    {
+                        yield Ok(RawStreamingChoice::Reasoning { id: None, content });
+                    }
+
+                    for incoming in incoming_tool_calls {
                         if let Some(existing) = tool_calls.get(&incoming.index)
                             && profile.should_evict(existing, &incoming)
                             && let Some(evicted) = tool_calls.remove(&incoming.index)
@@ -305,26 +334,17 @@ where
                         }
                     }
 
-                    for detail in &choice.details {
+                    for detail in &details {
                         profile.decorate_tool_call(detail, &mut tool_calls);
                     }
 
-                    if let Some(reasoning) = choice.reasoning
-                        && !reasoning.is_empty()
-                    {
-                        yield Ok(RawStreamingChoice::ReasoningDelta {
-                            id: None,
-                            reasoning,
-                        });
-                    }
-
-                    if let Some(content) = choice.text
+                    if let Some(content) = text
                         && !content.is_empty()
                     {
                         yield Ok(RawStreamingChoice::Message(content));
                     }
 
-                    if choice.finish_reason == CompatibleFinishReason::ToolCalls {
+                    if finish_reason == CompatibleFinishReason::ToolCalls {
                         for tool_call in take_finalized_tool_calls(
                             &mut tool_calls,
                             DroppedToolCallContext::ToolCallsFinishReason,
@@ -351,6 +371,10 @@ where
             return;
         }
 
+        if let Some(content) = take_pending_reasoning(&mut pending_reasoning) {
+            yield Ok(RawStreamingChoice::Reasoning { id: None, content });
+        }
+
         for tool_call in
             take_finalized_tool_calls(&mut tool_calls, DroppedToolCallContext::EndOfStream)
         {
@@ -368,6 +392,13 @@ where
     Ok(streaming::StreamingCompletionResponse::stream(Box::pin(
         stream,
     )))
+}
+
+fn take_pending_reasoning(pending: &mut String) -> Option<ReasoningContent> {
+    (!pending.is_empty()).then(|| ReasoningContent::Text {
+        text: std::mem::take(pending),
+        signature: None,
+    })
 }
 
 fn record_usage<T>(span: &tracing::Span, usage: &T)

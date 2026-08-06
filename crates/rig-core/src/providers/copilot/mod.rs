@@ -1087,7 +1087,10 @@ where
 
                 yield Ok(RawStreamingChoice::FinalResponse(
                     CopilotStreamingResponse::Responses(
-                        responses_api::streaming::StreamingCompletionResponse { usage: final_usage }
+                        responses_api::streaming::StreamingCompletionResponse {
+                            usage: final_usage,
+                            service_tier: None,
+                        }
                     )
                 ));
             },

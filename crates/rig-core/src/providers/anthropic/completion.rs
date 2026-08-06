@@ -5,7 +5,7 @@ use crate::providers::anthropic::streaming::StreamingCompletionResponse;
 use crate::{
     OneOrMany,
     client::Provider,
-    completion::{self, CompletionError, GetTokenUsage},
+    completion::{self, CompletionError, GetServiceTier, GetTokenUsage, ServiceTier},
     http_client::HttpClientExt,
     message::{self, DocumentMediaType, DocumentSourceKind, MessageError, MimeType, Reasoning},
     one_or_many::string_or_one_or_many,
@@ -13,7 +13,7 @@ use crate::{
     wasm_compat::*,
 };
 use bytes::Bytes;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{convert::Infallible, str::FromStr};
 use tracing::{Instrument, Level, enabled, info_span};
 
@@ -65,6 +65,16 @@ pub struct CompletionResponse {
     pub usage: Usage,
 }
 
+impl GetServiceTier for CompletionResponse {
+    fn service_tier(&self) -> Option<ServiceTier> {
+        match self.usage.speed.as_ref()? {
+            AnthropicSpeed::Standard => Some(ServiceTier::Standard),
+            AnthropicSpeed::Fast => Some(ServiceTier::Fast),
+            AnthropicSpeed::Other(_) => None,
+        }
+    }
+}
+
 impl ProviderResponseExt for CompletionResponse {
     type OutputMessage = Content;
     type Usage = Usage;
@@ -109,6 +119,42 @@ pub struct Usage {
     pub cache_read_input_tokens: Option<u64>,
     pub cache_creation_input_tokens: Option<u64>,
     pub output_tokens: u64,
+    #[serde(default)]
+    pub speed: Option<AnthropicSpeed>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AnthropicSpeed {
+    Standard,
+    Fast,
+    Other(String),
+}
+
+impl Serialize for AnthropicSpeed {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(match self {
+            Self::Standard => "standard",
+            Self::Fast => "fast",
+            Self::Other(value) => value,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for AnthropicSpeed {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "standard" => Self::Standard,
+            "fast" => Self::Fast,
+            _ => Self::Other(value),
+        })
+    }
 }
 
 impl std::fmt::Display for Usage {
@@ -1538,6 +1584,7 @@ enum ApiResponse<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::completion::{GetServiceTier, ServiceTier};
     use serde_json::json;
     use serde_path_to_error::deserialize;
 
@@ -1556,6 +1603,38 @@ mod tests {
     fn unknown_model_uses_conservative_default_max_tokens_fallback() {
         assert_eq!(default_max_tokens_for_model("claude-unknown"), None);
         assert_eq!(default_max_tokens_with_fallback("claude-unknown"), 2_048);
+    }
+
+    #[test]
+    fn completion_response_reports_service_tier_from_usage_speed() {
+        let cases = [
+            (Some("standard"), Some(ServiceTier::Standard)),
+            (Some("fast"), Some(ServiceTier::Fast)),
+            (Some("experimental"), None),
+            (None, None),
+        ];
+
+        for (speed, expected) in cases {
+            let mut usage = json!({
+                "input_tokens": 1,
+                "output_tokens": 1,
+            });
+            if let Some(speed) = speed {
+                usage["speed"] = json!(speed);
+            }
+            let response: CompletionResponse = serde_json::from_value(json!({
+                "content": [],
+                "id": "msg_123",
+                "model": "claude-sonnet-5",
+                "role": "assistant",
+                "stop_reason": "end_turn",
+                "stop_sequence": null,
+                "usage": usage,
+            }))
+            .expect("response should deserialize");
+
+            assert_eq!(response.service_tier(), expected, "{speed:?}");
+        }
     }
 
     #[test]
@@ -2471,6 +2550,7 @@ mod tests {
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
                 output_tokens: 2,
+                speed: None,
             },
         };
 
@@ -2499,6 +2579,7 @@ mod tests {
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
                 output_tokens: 2,
+                speed: None,
             },
         };
 

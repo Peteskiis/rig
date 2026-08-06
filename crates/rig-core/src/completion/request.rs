@@ -370,6 +370,18 @@ pub trait GetTokenUsage {
     fn token_usage(&self) -> Option<crate::completion::Usage>;
 }
 
+/// The effective provider service tier used for a completion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServiceTier {
+    Standard,
+    Fast,
+}
+
+/// Extracts the effective provider service tier from a completion response.
+pub trait GetServiceTier {
+    fn service_tier(&self) -> Option<ServiceTier>;
+}
+
 impl GetTokenUsage for () {
     fn token_usage(&self) -> Option<crate::completion::Usage> {
         None

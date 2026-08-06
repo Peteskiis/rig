@@ -6,11 +6,13 @@ use tracing::{Level, enabled, info_span};
 use tracing_futures::Instrument;
 
 use super::completion::{
-    AnthropicCompatibleProvider, CacheControl, Content, GenericCompletionModel, Message,
-    SystemContent, ToolChoice, ToolDefinition, Usage, apply_cache_control,
+    AnthropicCompatibleProvider, AnthropicSpeed, CacheControl, Content, GenericCompletionModel,
+    Message, SystemContent, ToolChoice, ToolDefinition, Usage, apply_cache_control,
     split_system_messages_from_history,
 };
-use crate::completion::{CompletionError, CompletionRequest, GetTokenUsage};
+use crate::completion::{
+    CompletionError, CompletionRequest, GetServiceTier, GetTokenUsage, ServiceTier,
+};
 use crate::http_client::sse::{Event, GenericEventSource};
 use crate::http_client::{self, HttpClientExt};
 use crate::json_utils::merge_inplace;
@@ -83,6 +85,8 @@ pub struct PartialUsage {
     pub cache_creation_input_tokens: Option<u64>,
     #[serde(default)]
     pub cache_read_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub speed: Option<AnthropicSpeed>,
 }
 
 impl GetTokenUsage for PartialUsage {
@@ -133,6 +137,16 @@ impl GetTokenUsage for StreamingCompletionResponse {
             + usage.output_tokens;
 
         Some(usage)
+    }
+}
+
+impl GetServiceTier for StreamingCompletionResponse {
+    fn service_tier(&self) -> Option<ServiceTier> {
+        match self.usage.speed.as_ref()? {
+            AnthropicSpeed::Standard => Some(ServiceTier::Standard),
+            AnthropicSpeed::Fast => Some(ServiceTier::Fast),
+            AnthropicSpeed::Other(_) => None,
+        }
     }
 }
 
@@ -326,7 +340,8 @@ where
                                                  output_tokens: usage.output_tokens,
                                                  input_tokens: usize::try_from(input_tokens).ok(),
                                                  cache_creation_input_tokens: usage.cache_creation_input_tokens,
-                                                 cache_read_input_tokens: usage.cache_read_input_tokens
+                                                 cache_read_input_tokens: usage.cache_read_input_tokens,
+                                                 speed: usage.speed.clone(),
                                             };
 
                                             let span = tracing::Span::current();
@@ -511,6 +526,29 @@ fn handle_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::completion::{GetServiceTier, ServiceTier};
+
+    #[test]
+    fn final_response_reports_service_tier_from_terminal_usage_speed() {
+        let cases = [
+            (Some("standard"), Some(ServiceTier::Standard)),
+            (Some("fast"), Some(ServiceTier::Fast)),
+            (Some("experimental"), None),
+            (None, None),
+        ];
+
+        for (speed, expected) in cases {
+            let mut usage = json!({ "output_tokens": 1 });
+            if let Some(speed) = speed {
+                usage["speed"] = json!(speed);
+            }
+            let usage: PartialUsage =
+                serde_json::from_value(usage).expect("terminal usage should deserialize");
+            let response = StreamingCompletionResponse { usage };
+
+            assert_eq!(response.service_tier(), expected, "{speed:?}");
+        }
+    }
 
     #[test]
     fn test_thinking_delta_deserialization() {

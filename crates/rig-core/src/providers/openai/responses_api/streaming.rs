@@ -1,10 +1,12 @@
 //! The streaming module for the OpenAI Responses API.
 //! Please see the `openai_streaming` or `openai_streaming_with_tools` example for more practical usage.
-use crate::completion::{self, CompletionError, GetTokenUsage};
+use crate::completion::{self, CompletionError, GetServiceTier, GetTokenUsage, ServiceTier};
 use crate::http_client::HttpClientExt;
 use crate::http_client::sse::{Event, GenericEventSource};
 use crate::message::ReasoningContent;
-use crate::providers::openai::responses_api::{ReasoningSummary, ResponsesUsage};
+use crate::providers::openai::responses_api::{
+    OpenAIServiceTier, ReasoningSummary, ResponsesUsage,
+};
 use crate::streaming;
 use crate::streaming::RawStreamingChoice;
 use crate::wasm_compat::WasmCompatSend;
@@ -38,6 +40,9 @@ pub enum StreamingCompletionChunk {
 pub struct StreamingCompletionResponse {
     /// Token usage
     pub usage: ResponsesUsage,
+    /// Effective service tier reported in the terminal response.
+    #[serde(default)]
+    pub service_tier: Option<OpenAIServiceTier>,
 }
 
 pub(crate) fn reasoning_choices_from_done_item(
@@ -68,6 +73,16 @@ pub(crate) fn reasoning_choices_from_done_item(
 impl GetTokenUsage for StreamingCompletionResponse {
     fn token_usage(&self) -> Option<crate::completion::Usage> {
         self.usage.token_usage()
+    }
+}
+
+impl GetServiceTier for StreamingCompletionResponse {
+    fn service_tier(&self) -> Option<ServiceTier> {
+        match self.service_tier.as_ref()? {
+            OpenAIServiceTier::Default | OpenAIServiceTier::Standard => Some(ServiceTier::Standard),
+            OpenAIServiceTier::Fast | OpenAIServiceTier::Priority => Some(ServiceTier::Fast),
+            OpenAIServiceTier::Auto | OpenAIServiceTier::Flex | OpenAIServiceTier::Other(_) => None,
+        }
     }
 }
 
@@ -255,6 +270,7 @@ pub(crate) fn parse_sse_completion_body(
 
 struct RawChoiceAccumulator {
     final_usage: ResponsesUsage,
+    final_service_tier: Option<OpenAIServiceTier>,
     tool_calls: Vec<StreamingRawChoice>,
     tool_call_internal_ids: std::collections::HashMap<String, String>,
 }
@@ -263,6 +279,7 @@ impl RawChoiceAccumulator {
     fn new(initial_usage: ResponsesUsage) -> Self {
         Self {
             final_usage: initial_usage,
+            final_service_tier: None,
             tool_calls: Vec::new(),
             tool_call_internal_ids: std::collections::HashMap::new(),
         }
@@ -340,6 +357,7 @@ impl RawChoiceAccumulator {
                 if let Some(usage) = response.usage {
                     self.final_usage = usage;
                 }
+                self.final_service_tier = response.additional_parameters.service_tier;
                 Ok(())
             }
             ResponseChunkKind::ResponseFailed | ResponseChunkKind::ResponseIncomplete
@@ -408,6 +426,7 @@ impl RawChoiceAccumulator {
         choices.push(RawStreamingChoice::FinalResponse(
             StreamingCompletionResponse {
                 usage: self.final_usage,
+                service_tier: self.final_service_tier,
             },
         ));
         choices
@@ -915,12 +934,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::{ItemChunkKind, StreamingCompletionChunk, reasoning_choices_from_done_item};
-    use crate::completion::CompletionModel;
+    use crate::completion::{CompletionModel, GetServiceTier, ServiceTier};
     use crate::message::ReasoningContent;
     use crate::providers::internal::openai_chat_completions_compatible::test_support::sse_bytes_from_json_events;
     use crate::providers::openai::responses_api::{
-        AdditionalParameters, CompletionResponse, IncompleteDetailsReason, OutputTokensDetails,
-        ReasoningSummary, ResponseError, ResponseObject, ResponseStatus, ResponsesUsage,
+        AdditionalParameters, CompletionResponse, IncompleteDetailsReason, OpenAIServiceTier,
+        OutputTokensDetails, ReasoningSummary, ResponseError, ResponseObject, ResponseStatus,
+        ResponsesUsage,
     };
     use crate::streaming::{RawStreamingChoice, StreamedAssistantContent};
     use crate::test_utils::MockStreamingClient;
@@ -1027,6 +1047,34 @@ mod tests {
                 content: ReasoningContent::Encrypted(data),
             }) if id == "rs_1" && data == "enc_blob"
         ));
+    }
+
+    #[test]
+    fn final_response_reports_effective_service_tier() {
+        let cases = [
+            (
+                Some(OpenAIServiceTier::Standard),
+                Some(ServiceTier::Standard),
+            ),
+            (Some(OpenAIServiceTier::Fast), Some(ServiceTier::Fast)),
+            (Some(OpenAIServiceTier::Auto), None),
+            (
+                Some(OpenAIServiceTier::Other(
+                    "provider_experimental".to_string(),
+                )),
+                None,
+            ),
+            (None, None),
+        ];
+
+        for (service_tier, expected) in cases {
+            let response = super::StreamingCompletionResponse {
+                usage: ResponsesUsage::new(),
+                service_tier,
+            };
+
+            assert_eq!(response.service_tier(), expected);
+        }
     }
 
     #[test]

@@ -526,10 +526,63 @@ fn handle_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::CompletionClient;
+    use crate::completion::CompletionModel;
     use crate::completion::{GetServiceTier, ServiceTier};
+    use crate::providers::anthropic::{self, completion::CLAUDE_SONNET_4_6};
+    use crate::providers::internal::openai_chat_completions_compatible::test_support::sse_bytes_from_json_events;
+    use crate::streaming::StreamedAssistantContent;
+    use crate::test_utils::MockStreamingClient;
 
-    #[test]
-    fn final_response_reports_service_tier_from_terminal_usage_speed() {
+    async fn final_response_from_terminal_speed(
+        speed: Option<&str>,
+    ) -> StreamingCompletionResponse {
+        let mut terminal_usage = json!({ "output_tokens": 2 });
+        if let Some(speed) = speed {
+            terminal_usage["speed"] = json!(speed);
+        }
+        let events = [
+            json!({
+                "type": "message_start",
+                "message": {
+                    "id": "msg_123",
+                    "role": "assistant",
+                    "content": [],
+                    "model": CLAUDE_SONNET_4_6,
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": { "input_tokens": 3, "output_tokens": 0 },
+                },
+            }),
+            json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": "end_turn", "stop_sequence": null },
+                "usage": terminal_usage,
+            }),
+        ];
+        let client = anthropic::Client::builder()
+            .http_client(MockStreamingClient {
+                sse_bytes: sse_bytes_from_json_events(&events),
+            })
+            .api_key("test-key")
+            .build()
+            .expect("client should build");
+        let model = client.completion_model(CLAUDE_SONNET_4_6);
+        let request = model.completion_request("hello").max_tokens(4).build();
+        let mut stream = model.stream(request).await.expect("stream should start");
+
+        while let Some(item) = stream.next().await {
+            match item.expect("completed stream should not error") {
+                StreamedAssistantContent::Final(response) => return response,
+                _ => continue,
+            }
+        }
+
+        panic!("stream should yield a final response");
+    }
+
+    #[tokio::test]
+    async fn terminal_message_delta_propagates_service_tier() {
         let cases = [
             (Some("standard"), Some(ServiceTier::Standard)),
             (Some("fast"), Some(ServiceTier::Fast)),
@@ -538,13 +591,7 @@ mod tests {
         ];
 
         for (speed, expected) in cases {
-            let mut usage = json!({ "output_tokens": 1 });
-            if let Some(speed) = speed {
-                usage["speed"] = json!(speed);
-            }
-            let usage: PartialUsage =
-                serde_json::from_value(usage).expect("terminal usage should deserialize");
-            let response = StreamingCompletionResponse { usage };
+            let response = final_response_from_terminal_speed(speed).await;
 
             assert_eq!(response.service_tier(), expected, "{speed:?}");
         }

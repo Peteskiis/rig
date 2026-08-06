@@ -991,7 +991,9 @@ mod tests {
             .expect_err("stream should surface a provider error")
     }
 
-    async fn final_usage_from_event(event: serde_json::Value) -> ResponsesUsage {
+    async fn final_response_from_event(
+        event: serde_json::Value,
+    ) -> super::StreamingCompletionResponse {
         let client = openai::Client::builder()
             .http_client(MockStreamingClient {
                 sse_bytes: sse_bytes_from_json_events(&[event]),
@@ -1005,12 +1007,16 @@ mod tests {
 
         while let Some(item) = stream.next().await {
             match item.expect("completed stream should not error") {
-                StreamedAssistantContent::Final(res) => return res.usage,
+                StreamedAssistantContent::Final(res) => return res,
                 _ => continue,
             }
         }
 
         panic!("stream should yield a final response");
+    }
+
+    async fn final_usage_from_event(event: serde_json::Value) -> ResponsesUsage {
+        final_response_from_event(event).await.usage
     }
 
     #[test]
@@ -1049,15 +1055,21 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn final_response_reports_effective_service_tier() {
+    #[tokio::test]
+    async fn completed_response_event_propagates_effective_service_tier() {
         let cases = [
+            (
+                Some(OpenAIServiceTier::Default),
+                Some(ServiceTier::Standard),
+            ),
             (
                 Some(OpenAIServiceTier::Standard),
                 Some(ServiceTier::Standard),
             ),
             (Some(OpenAIServiceTier::Fast), Some(ServiceTier::Fast)),
+            (Some(OpenAIServiceTier::Priority), Some(ServiceTier::Fast)),
             (Some(OpenAIServiceTier::Auto), None),
+            (Some(OpenAIServiceTier::Flex), None),
             (
                 Some(OpenAIServiceTier::Other(
                     "provider_experimental".to_string(),
@@ -1068,12 +1080,16 @@ mod tests {
         ];
 
         for (service_tier, expected) in cases {
-            let response = super::StreamingCompletionResponse {
-                usage: ResponsesUsage::new(),
-                service_tier,
-            };
+            let mut response = sample_response(ResponseStatus::Completed);
+            response.additional_parameters.service_tier = service_tier;
+            let event = json!({
+                "type": "response.completed",
+                "sequence_number": 1,
+                "response": response,
+            });
+            let final_response = final_response_from_event(event).await;
 
-            assert_eq!(response.service_tier(), expected);
+            assert_eq!(final_response.service_tier(), expected);
         }
     }
 

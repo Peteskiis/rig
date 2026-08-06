@@ -1517,41 +1517,30 @@ where
                 .await
                 .map_err(CompletionError::HttpError)?;
 
-            if response.status().is_success() {
-                match serde_json::from_slice::<ApiResponse<CompletionResponse>>(
-                    response
-                        .into_body()
-                        .await
-                        .map_err(CompletionError::HttpError)?
-                        .to_vec()
-                        .as_slice(),
-                )? {
-                    ApiResponse::Message(completion) => {
-                        let span = tracing::Span::current();
-                        span.record_response_metadata(&completion);
-                        span.record_token_usage(&completion.usage);
-                        if enabled!(Level::TRACE) {
-                            tracing::trace!(
-                                target: "rig::completions",
-                                "Anthropic completion response: {}",
-                                serde_json::to_string_pretty(&completion)?
-                            );
-                        }
-                        completion.try_into()
+            match serde_json::from_slice::<ApiResponse<CompletionResponse>>(
+                response
+                    .into_body()
+                    .await
+                    .map_err(CompletionError::HttpError)?
+                    .to_vec()
+                    .as_slice(),
+            )? {
+                ApiResponse::Message(completion) => {
+                    let span = tracing::Span::current();
+                    span.record_response_metadata(&completion);
+                    span.record_token_usage(&completion.usage);
+                    if enabled!(Level::TRACE) {
+                        tracing::trace!(
+                            target: "rig::completions",
+                            "Anthropic completion response: {}",
+                            serde_json::to_string_pretty(&completion)?
+                        );
                     }
-                    ApiResponse::Error(ApiErrorResponse { message }) => {
-                        Err(CompletionError::ResponseError(message))
-                    }
+                    completion.try_into()
                 }
-            } else {
-                let text: String = String::from_utf8_lossy(
-                    &response
-                        .into_body()
-                        .await
-                        .map_err(CompletionError::HttpError)?,
-                )
-                .into();
-                Err(CompletionError::ProviderError(text))
+                ApiResponse::Error(ApiErrorResponse { message }) => {
+                    Err(CompletionError::ResponseError(message))
+                }
             }
         }
         .instrument(span)
@@ -1584,9 +1573,99 @@ enum ApiResponse<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::completion::{GetServiceTier, ServiceTier};
+    use crate::{
+        client::CompletionClient,
+        completion::{CompletionModel as _, GetServiceTier, ServiceTier},
+        http_client,
+        providers::anthropic,
+    };
+    use axum::{Router, body::Body, routing::post};
+    use http::{StatusCode, header};
     use serde_json::json;
     use serde_path_to_error::deserialize;
+
+    async fn status_server(status: StatusCode, retry_after: Option<&str>) -> String {
+        let retry_after = retry_after.map(str::to_owned);
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move || {
+                let retry_after = retry_after.clone();
+                async move {
+                    let mut response = axum::response::Response::new(Body::from(
+                        r#"{"type":"error","error":{"type":"rate_limit_error","message":"fast limit reached"}}"#,
+                    ));
+                    *response.status_mut() = status;
+                    response.headers_mut().insert(
+                        header::CONTENT_TYPE,
+                        header::HeaderValue::from_static("application/json"),
+                    );
+                    if let Some(retry_after) = retry_after {
+                        response.headers_mut().insert(
+                            header::RETRY_AFTER,
+                            header::HeaderValue::from_str(&retry_after)
+                                .expect("test retry-after header should be valid"),
+                        );
+                    }
+                    response
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let address = listener
+            .local_addr()
+            .expect("test server should have a local address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should run");
+        });
+
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn anthropic_completion_preserves_rate_limit_status_and_retry_after() {
+        let base_url = status_server(StatusCode::TOO_MANY_REQUESTS, Some("17")).await;
+        let client = anthropic::Client::builder()
+            .api_key("test-key")
+            .base_url(base_url)
+            .build()
+            .expect("test client should build");
+        let model = client.completion_model(CLAUDE_SONNET_4_6);
+        let request = model.completion_request("hello").max_tokens(4).build();
+
+        let error = model
+            .completion(request)
+            .await
+            .expect_err("rate-limit response should fail");
+
+        match error {
+            crate::completion::CompletionError::HttpError(http_client::Error::Status {
+                status,
+                retry_after_secs,
+                message,
+            }) => {
+                assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+                assert_eq!(retry_after_secs, Some(17));
+                assert!(message.len() <= 8 * 1024);
+                assert!(message.contains("fast limit reached"));
+                assert!(
+                    !format!(
+                        "{}",
+                        http_client::Error::Status {
+                            status,
+                            retry_after_secs,
+                            message,
+                        }
+                    )
+                    .contains("fast limit reached")
+                );
+            }
+            other => panic!("expected structured HTTP error, got {other:?}"),
+        }
+    }
 
     #[test]
     fn current_model_default_max_tokens_match_anthropic_limits() {

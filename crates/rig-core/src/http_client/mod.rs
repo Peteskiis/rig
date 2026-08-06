@@ -7,9 +7,12 @@ pub mod multipart;
 pub mod retry;
 pub mod sse;
 use crate::wasm_compat::*;
+use futures::StreamExt;
 pub use multipart::MultipartForm;
 pub use reqwest::Client as ReqwestClient;
 use std::pin::Pin;
+
+const MAX_ERROR_MESSAGE_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -19,6 +22,12 @@ pub enum Error {
     InvalidStatusCode(StatusCode),
     #[error("Invalid status code {0} with message: {1}")]
     InvalidStatusCodeWithMessage(StatusCode, String),
+    #[error("upstream returned HTTP {status}")]
+    Status {
+        status: StatusCode,
+        retry_after_secs: Option<u64>,
+        message: String,
+    },
     #[error("Header value outside of legal range: {0}")]
     InvalidHeaderValue(#[from] http::header::InvalidHeaderValue),
     #[error("Request in error state, cannot access headers")]
@@ -48,13 +57,68 @@ fn instance_error<E: std::error::Error + 'static>(error: E) -> Error {
     Error::Instance(error.into())
 }
 
+pub(super) fn status_error(
+    status: StatusCode,
+    headers: &HeaderMap,
+    message: impl Into<String>,
+) -> Error {
+    Error::Status {
+        status,
+        retry_after_secs: headers
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse().ok()),
+        message: bound_error_message(message.into()),
+    }
+}
+
+fn bound_error_message(mut message: String) -> String {
+    if message.len() > MAX_ERROR_MESSAGE_BYTES {
+        let mut end = MAX_ERROR_MESSAGE_BYTES;
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        message.truncate(end);
+    }
+    message
+}
+
 async fn non_success_status_error(response: reqwest::Response) -> Error {
     let status = response.status();
-    let message = response
-        .text()
-        .await
-        .unwrap_or_else(|error| format!("failed to read error response body: {error}"));
-    Error::InvalidStatusCodeWithMessage(status, message)
+    let headers = response.headers().clone();
+    let mut body = Vec::with_capacity(MAX_ERROR_MESSAGE_BYTES);
+    let mut chunks = response.bytes_stream();
+
+    while let Some(chunk) = chunks.next().await {
+        match chunk {
+            Ok(chunk) => {
+                let remaining = MAX_ERROR_MESSAGE_BYTES.saturating_sub(body.len());
+                if remaining == 0 {
+                    break;
+                }
+                body.extend_from_slice(chunk.get(..remaining).unwrap_or(&chunk));
+                if body.len() == MAX_ERROR_MESSAGE_BYTES {
+                    break;
+                }
+            }
+            Err(error) => {
+                if body.is_empty() {
+                    return status_error(
+                        status,
+                        &headers,
+                        format!("failed to read error response body: {error}"),
+                    );
+                }
+                break;
+            }
+        }
+    }
+
+    status_error(
+        status,
+        &headers,
+        String::from_utf8_lossy(&body).into_owned(),
+    )
 }
 
 pub type LazyBytes = WasmBoxedFuture<'static, Result<Bytes>>;

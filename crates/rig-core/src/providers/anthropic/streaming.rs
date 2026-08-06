@@ -370,7 +370,7 @@ where
                         }
                     },
                     Err(e) => {
-                        yield Err(CompletionError::ProviderError(format!("SSE Error: {e}")));
+                        yield Err(CompletionError::HttpError(e));
                         break;
                     }
                 }
@@ -527,12 +527,81 @@ fn handle_event(
 mod tests {
     use super::*;
     use crate::client::CompletionClient;
-    use crate::completion::CompletionModel;
+    use crate::completion::{CompletionError, CompletionModel};
     use crate::completion::{GetServiceTier, ServiceTier};
+    use crate::http_client;
     use crate::providers::anthropic::{self, completion::CLAUDE_SONNET_4_6};
     use crate::providers::internal::openai_chat_completions_compatible::test_support::sse_bytes_from_json_events;
     use crate::streaming::StreamedAssistantContent;
     use crate::test_utils::MockStreamingClient;
+    use axum::{Router, body::Body, routing::post};
+    use http::{StatusCode, header};
+
+    async fn status_server(status: StatusCode) -> String {
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move || async move {
+                let mut response = axum::response::Response::new(Body::from(
+                    r#"{"type":"error","error":{"type":"overloaded_error","message":"fast capacity exhausted"}}"#,
+                ));
+                *response.status_mut() = status;
+                response.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    header::HeaderValue::from_static("application/json"),
+                );
+                response
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let address = listener
+            .local_addr()
+            .expect("test server should have a local address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should run");
+        });
+
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_preserves_overload_status_without_retry_after() {
+        let base_url = status_server(StatusCode::from_u16(529).expect("529 should be valid")).await;
+        let client = anthropic::Client::builder()
+            .api_key("test-key")
+            .base_url(base_url)
+            .build()
+            .expect("test client should build");
+        let model = client.completion_model(CLAUDE_SONNET_4_6);
+        let request = model.completion_request("hello").max_tokens(4).build();
+        let mut stream = model.stream(request).await.expect("stream should start");
+
+        let error = stream
+            .next()
+            .await
+            .expect("stream should yield setup error")
+            .expect_err("overload response should fail");
+
+        match error {
+            CompletionError::HttpError(http_client::Error::Status {
+                status,
+                retry_after_secs,
+                message,
+            }) => {
+                assert_eq!(
+                    status,
+                    StatusCode::from_u16(529).expect("529 should be valid")
+                );
+                assert_eq!(retry_after_secs, None);
+                assert!(message.len() <= 8 * 1024);
+                assert!(message.contains("fast capacity exhausted"));
+            }
+            other => panic!("expected structured HTTP error, got {other:?}"),
+        }
+    }
 
     async fn final_response_from_terminal_speed(
         speed: Option<&str>,

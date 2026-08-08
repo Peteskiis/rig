@@ -28,8 +28,12 @@ pub struct CapturedHttpRequest {
 pub enum MockHttpResponse {
     /// Return this body with a successful HTTP status.
     Success(Bytes),
+    /// Return this body as an HTTP response with the given status.
+    Response(http::StatusCode, Bytes),
     /// Return a status-code error with the given body text.
     Error(http::StatusCode, String),
+    /// Return a structured status-code error with the given body text.
+    StatusError(http::StatusCode, String),
 }
 
 impl MockHttpResponse {
@@ -41,6 +45,16 @@ impl MockHttpResponse {
     /// Create an error response with a status code and message.
     pub fn error(status: http::StatusCode, message: impl Into<String>) -> Self {
         Self::Error(status, message.into())
+    }
+
+    /// Create an HTTP response with the given status and body.
+    pub fn response(status: http::StatusCode, body: impl Into<Bytes>) -> Self {
+        Self::Response(status, body.into())
+    }
+
+    /// Create a structured HTTP status error with the given message.
+    pub fn status_error(status: http::StatusCode, message: impl Into<String>) -> Self {
+        Self::StatusError(status, message.into())
     }
 }
 
@@ -72,6 +86,22 @@ impl RecordingHttpClient {
         Self {
             requests: Arc::new(Mutex::new(Vec::new())),
             response: Arc::new(Mutex::new(MockHttpResponse::error(status, message))),
+        }
+    }
+
+    /// Create a client that returns an HTTP response with the given status and body.
+    pub fn with_response(status: http::StatusCode, body: impl Into<Bytes>) -> Self {
+        Self {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            response: Arc::new(Mutex::new(MockHttpResponse::response(status, body))),
+        }
+    }
+
+    /// Create a client that returns a structured status error for unary requests.
+    pub fn with_status_error(status: http::StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            response: Arc::new(Mutex::new(MockHttpResponse::status_error(status, message))),
         }
     }
 
@@ -126,17 +156,25 @@ impl HttpClientExt for RecordingHttpClient {
         }
 
         async move {
-            let response_body = match response {
-                MockHttpResponse::Success(response_body) => response_body,
+            let (status, response_body) = match response {
+                MockHttpResponse::Success(response_body) => (http::StatusCode::OK, response_body),
+                MockHttpResponse::Response(status, response_body) => (status, response_body),
                 MockHttpResponse::Error(status, message) => {
                     return Err(http_client::Error::InvalidStatusCodeWithMessage(
                         status, message,
                     ));
                 }
+                MockHttpResponse::StatusError(status, message) => {
+                    return Err(http_client::Error::Status {
+                        status,
+                        retry_after_secs: None,
+                        message,
+                    });
+                }
             };
             let body: LazyBody<U> = Box::pin(async move { Ok(U::from(response_body)) });
             Response::builder()
-                .status(http::StatusCode::OK)
+                .status(status)
                 .body(body)
                 .map_err(http_client::Error::Protocol)
         }

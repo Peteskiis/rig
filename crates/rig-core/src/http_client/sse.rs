@@ -362,7 +362,11 @@ fn check_response<T>(
     allow_missing_content_type: bool,
 ) -> Result<Response<T>, super::Error> {
     let StatusCode::OK = response.status() else {
-        return Err(super::Error::InvalidStatusCode(response.status()));
+        return Err(super::status_error(
+            response.status(),
+            response.headers(),
+            String::new(),
+        ));
     };
 
     let content_type =

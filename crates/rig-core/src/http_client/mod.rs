@@ -3,15 +3,19 @@ use bytes::Bytes;
 pub use http::{HeaderMap, HeaderValue, Method, Request, Response, Uri, request::Builder};
 use http::{HeaderName, StatusCode};
 use reqwest::Body;
+use std::fmt;
 pub mod multipart;
 pub mod retry;
 pub mod sse;
 use crate::wasm_compat::*;
+use futures::StreamExt;
 pub use multipart::MultipartForm;
 pub use reqwest::Client as ReqwestClient;
 use std::pin::Pin;
 
-#[derive(Debug, thiserror::Error)]
+const MAX_ERROR_MESSAGE_BYTES: usize = 8 * 1024;
+
+#[derive(thiserror::Error)]
 pub enum Error {
     #[error("Http error: {0}")]
     Protocol(#[from] http::Error),
@@ -19,6 +23,16 @@ pub enum Error {
     InvalidStatusCode(StatusCode),
     #[error("Invalid status code {0} with message: {1}")]
     InvalidStatusCodeWithMessage(StatusCode, String),
+    /// A non-success response returned by an upstream service.
+    #[error("upstream returned HTTP {status}")]
+    Status {
+        /// The upstream HTTP response status.
+        status: StatusCode,
+        /// Numeric `Retry-After` delay, when supplied by the upstream service.
+        retry_after_secs: Option<u64>,
+        /// A bounded response-body preview for structured error handling.
+        message: String,
+    },
     #[error("Header value outside of legal range: {0}")]
     InvalidHeaderValue(#[from] http::header::InvalidHeaderValue),
     #[error("Request in error state, cannot access headers")]
@@ -36,6 +50,44 @@ pub enum Error {
     Instance(#[from] Box<dyn std::error::Error + 'static>),
 }
 
+impl fmt::Debug for Error {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Protocol(error) => formatter.debug_tuple("Protocol").field(error).finish(),
+            Self::InvalidStatusCode(status) => formatter
+                .debug_tuple("InvalidStatusCode")
+                .field(status)
+                .finish(),
+            Self::InvalidStatusCodeWithMessage(status, message) => formatter
+                .debug_tuple("InvalidStatusCodeWithMessage")
+                .field(status)
+                .field(message)
+                .finish(),
+            Self::Status {
+                status,
+                retry_after_secs,
+                ..
+            } => formatter
+                .debug_struct("Status")
+                .field("status", status)
+                .field("retry_after_secs", retry_after_secs)
+                .field("message", &"<redacted>")
+                .finish(),
+            Self::InvalidHeaderValue(error) => formatter
+                .debug_tuple("InvalidHeaderValue")
+                .field(error)
+                .finish(),
+            Self::NoHeaders => formatter.write_str("NoHeaders"),
+            Self::StreamEnded => formatter.write_str("StreamEnded"),
+            Self::InvalidContentType(content_type) => formatter
+                .debug_tuple("InvalidContentType")
+                .field(content_type)
+                .finish(),
+            Self::Instance(error) => formatter.debug_tuple("Instance").field(error).finish(),
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(not(target_family = "wasm"))]
@@ -48,13 +100,68 @@ fn instance_error<E: std::error::Error + 'static>(error: E) -> Error {
     Error::Instance(error.into())
 }
 
+pub(super) fn status_error(
+    status: StatusCode,
+    headers: &HeaderMap,
+    message: impl Into<String>,
+) -> Error {
+    Error::Status {
+        status,
+        retry_after_secs: headers
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse().ok()),
+        message: bound_error_message(message.into()),
+    }
+}
+
+fn bound_error_message(mut message: String) -> String {
+    if message.len() > MAX_ERROR_MESSAGE_BYTES {
+        let mut end = MAX_ERROR_MESSAGE_BYTES;
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        message.truncate(end);
+    }
+    message
+}
+
 async fn non_success_status_error(response: reqwest::Response) -> Error {
     let status = response.status();
-    let message = response
-        .text()
-        .await
-        .unwrap_or_else(|error| format!("failed to read error response body: {error}"));
-    Error::InvalidStatusCodeWithMessage(status, message)
+    let headers = response.headers().clone();
+    let mut body = Vec::with_capacity(MAX_ERROR_MESSAGE_BYTES);
+    let mut chunks = response.bytes_stream();
+
+    while let Some(chunk) = chunks.next().await {
+        match chunk {
+            Ok(chunk) => {
+                let remaining = MAX_ERROR_MESSAGE_BYTES.saturating_sub(body.len());
+                if remaining == 0 {
+                    break;
+                }
+                body.extend_from_slice(chunk.get(..remaining).unwrap_or(&chunk));
+                if body.len() == MAX_ERROR_MESSAGE_BYTES {
+                    break;
+                }
+            }
+            Err(error) => {
+                if body.is_empty() {
+                    return status_error(
+                        status,
+                        &headers,
+                        format!("failed to read error response body: {error}"),
+                    );
+                }
+                break;
+            }
+        }
+    }
+
+    status_error(
+        status,
+        &headers,
+        String::from_utf8_lossy(&body).into_owned(),
+    )
 }
 
 pub type LazyBytes = WasmBoxedFuture<'static, Result<Bytes>>;

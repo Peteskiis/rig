@@ -6,11 +6,13 @@ use tracing::{Level, enabled, info_span};
 use tracing_futures::Instrument;
 
 use super::completion::{
-    AnthropicCompatibleProvider, CacheControl, Content, GenericCompletionModel, Message,
-    SystemContent, ToolChoice, ToolDefinition, Usage, apply_cache_control,
+    AnthropicCompatibleProvider, AnthropicSpeed, CacheControl, Content, GenericCompletionModel,
+    Message, SystemContent, ToolChoice, ToolDefinition, Usage, apply_cache_control,
     split_system_messages_from_history,
 };
-use crate::completion::{CompletionError, CompletionRequest, GetTokenUsage};
+use crate::completion::{
+    CompletionError, CompletionRequest, GetServiceTier, GetTokenUsage, ServiceTier,
+};
 use crate::http_client::sse::{Event, GenericEventSource};
 use crate::http_client::{self, HttpClientExt};
 use crate::json_utils::merge_inplace;
@@ -83,6 +85,8 @@ pub struct PartialUsage {
     pub cache_creation_input_tokens: Option<u64>,
     #[serde(default)]
     pub cache_read_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub speed: Option<AnthropicSpeed>,
 }
 
 impl GetTokenUsage for PartialUsage {
@@ -133,6 +137,16 @@ impl GetTokenUsage for StreamingCompletionResponse {
             + usage.output_tokens;
 
         Some(usage)
+    }
+}
+
+impl GetServiceTier for StreamingCompletionResponse {
+    fn service_tier(&self) -> Option<ServiceTier> {
+        match self.usage.speed.as_ref()? {
+            AnthropicSpeed::Standard => Some(ServiceTier::Standard),
+            AnthropicSpeed::Fast => Some(ServiceTier::Fast),
+            AnthropicSpeed::Other(_) => None,
+        }
     }
 }
 
@@ -326,7 +340,8 @@ where
                                                  output_tokens: usage.output_tokens,
                                                  input_tokens: usize::try_from(input_tokens).ok(),
                                                  cache_creation_input_tokens: usage.cache_creation_input_tokens,
-                                                 cache_read_input_tokens: usage.cache_read_input_tokens
+                                                 cache_read_input_tokens: usage.cache_read_input_tokens,
+                                                 speed: usage.speed.clone(),
                                             };
 
                                             let span = tracing::Span::current();
@@ -355,7 +370,7 @@ where
                         }
                     },
                     Err(e) => {
-                        yield Err(CompletionError::ProviderError(format!("SSE Error: {e}")));
+                        yield Err(CompletionError::HttpError(e));
                         break;
                     }
                 }
@@ -511,6 +526,145 @@ fn handle_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::CompletionClient;
+    use crate::completion::{CompletionError, CompletionModel};
+    use crate::completion::{GetServiceTier, ServiceTier};
+    use crate::http_client;
+    use crate::providers::anthropic::{self, completion::CLAUDE_SONNET_4_6};
+    use crate::providers::internal::openai_chat_completions_compatible::test_support::sse_bytes_from_json_events;
+    use crate::streaming::StreamedAssistantContent;
+    use crate::test_utils::MockStreamingClient;
+    use axum::{Router, body::Body, routing::post};
+    use http::{StatusCode, header};
+
+    async fn status_server(status: StatusCode) -> String {
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move || async move {
+                let mut response = axum::response::Response::new(Body::from(
+                    r#"{"type":"error","error":{"type":"overloaded_error","message":"fast capacity exhausted"}}"#,
+                ));
+                *response.status_mut() = status;
+                response.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    header::HeaderValue::from_static("application/json"),
+                );
+                response
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let address = listener
+            .local_addr()
+            .expect("test server should have a local address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should run");
+        });
+
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_preserves_overload_status_without_retry_after() {
+        let base_url = status_server(StatusCode::from_u16(529).expect("529 should be valid")).await;
+        let client = anthropic::Client::builder()
+            .api_key("test-key")
+            .base_url(base_url)
+            .build()
+            .expect("test client should build");
+        let model = client.completion_model(CLAUDE_SONNET_4_6);
+        let request = model.completion_request("hello").max_tokens(4).build();
+        let mut stream = model.stream(request).await.expect("stream should start");
+
+        let error = stream
+            .next()
+            .await
+            .expect("stream should yield setup error")
+            .expect_err("overload response should fail");
+
+        match error {
+            CompletionError::HttpError(http_client::Error::Status {
+                status,
+                retry_after_secs,
+                message,
+            }) => {
+                assert_eq!(
+                    status,
+                    StatusCode::from_u16(529).expect("529 should be valid")
+                );
+                assert_eq!(retry_after_secs, None);
+                assert!(message.len() <= 8 * 1024);
+                assert!(message.contains("fast capacity exhausted"));
+            }
+            other => panic!("expected structured HTTP error, got {other:?}"),
+        }
+    }
+
+    async fn final_response_from_terminal_speed(
+        speed: Option<&str>,
+    ) -> StreamingCompletionResponse {
+        let mut terminal_usage = json!({ "output_tokens": 2 });
+        if let Some(speed) = speed {
+            terminal_usage["speed"] = json!(speed);
+        }
+        let events = [
+            json!({
+                "type": "message_start",
+                "message": {
+                    "id": "msg_123",
+                    "role": "assistant",
+                    "content": [],
+                    "model": CLAUDE_SONNET_4_6,
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": { "input_tokens": 3, "output_tokens": 0 },
+                },
+            }),
+            json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": "end_turn", "stop_sequence": null },
+                "usage": terminal_usage,
+            }),
+        ];
+        let client = anthropic::Client::builder()
+            .http_client(MockStreamingClient {
+                sse_bytes: sse_bytes_from_json_events(&events),
+            })
+            .api_key("test-key")
+            .build()
+            .expect("client should build");
+        let model = client.completion_model(CLAUDE_SONNET_4_6);
+        let request = model.completion_request("hello").max_tokens(4).build();
+        let mut stream = model.stream(request).await.expect("stream should start");
+
+        while let Some(item) = stream.next().await {
+            match item.expect("completed stream should not error") {
+                StreamedAssistantContent::Final(response) => return response,
+                _ => continue,
+            }
+        }
+
+        panic!("stream should yield a final response");
+    }
+
+    #[tokio::test]
+    async fn terminal_message_delta_propagates_service_tier() {
+        let cases = [
+            (Some("standard"), Some(ServiceTier::Standard)),
+            (Some("fast"), Some(ServiceTier::Fast)),
+            (Some("experimental"), None),
+            (None, None),
+        ];
+
+        for (speed, expected) in cases {
+            let response = final_response_from_terminal_speed(speed).await;
+
+            assert_eq!(response.service_tier(), expected, "{speed:?}");
+        }
+    }
 
     #[test]
     fn test_thinking_delta_deserialization() {

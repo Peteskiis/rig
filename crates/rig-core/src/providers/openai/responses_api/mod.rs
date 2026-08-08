@@ -16,7 +16,7 @@
 use super::InputAudio;
 use super::completion::ToolChoice;
 use super::responses_api::streaming::StreamingCompletionResponse;
-use crate::completion::{CompletionError, GetTokenUsage};
+use crate::completion::{CompletionError, GetServiceTier, GetTokenUsage, ServiceTier};
 use crate::http_client;
 use crate::http_client::HttpClientExt;
 use crate::json_utils;
@@ -1076,6 +1076,16 @@ pub struct CompletionResponse {
     pub additional_parameters: AdditionalParameters,
 }
 
+impl GetServiceTier for CompletionResponse {
+    fn service_tier(&self) -> Option<ServiceTier> {
+        match self.additional_parameters.service_tier.as_ref()? {
+            OpenAIServiceTier::Default | OpenAIServiceTier::Standard => Some(ServiceTier::Standard),
+            OpenAIServiceTier::Fast | OpenAIServiceTier::Priority => Some(ServiceTier::Fast),
+            OpenAIServiceTier::Auto | OpenAIServiceTier::Flex | OpenAIServiceTier::Other(_) => None,
+        }
+    }
+}
+
 /// Additional parameters for the completion request type for OpenAI's Response API: <https://platform.openai.com/docs/api-reference/responses/create>
 /// Intended to be derived from [`crate::completion::request::CompletionRequest`].
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]
@@ -1224,6 +1234,8 @@ pub enum OpenAIServiceTier {
     Default,
     /// Use the flex service tier.
     Flex,
+    /// Use the fast service tier.
+    Fast,
     /// Use the priority service tier.
     Priority,
     /// Use the standard service tier returned by OpenAI-compatible providers.
@@ -1241,6 +1253,7 @@ impl Serialize for OpenAIServiceTier {
             Self::Auto => "auto",
             Self::Default => "default",
             Self::Flex => "flex",
+            Self::Fast => "fast",
             Self::Priority => "priority",
             Self::Standard => "standard",
             Self::Other(value) => value,
@@ -1258,6 +1271,7 @@ impl<'de> Deserialize<'de> for OpenAIServiceTier {
             "auto" => Self::Auto,
             "default" => Self::Default,
             "flex" => Self::Flex,
+            "fast" => Self::Fast,
             "priority" => Self::Priority,
             "standard" => Self::Standard,
             _ => Self::Other(value),
@@ -1959,6 +1973,7 @@ impl FromStr for UserContent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::completion::{GetServiceTier, ServiceTier};
     use crate::message;
     use serde_json::json;
 
@@ -2053,11 +2068,45 @@ mod tests {
     }
 
     #[test]
+    fn completion_response_reports_effective_service_tier() {
+        let cases = [
+            ("default", Some(ServiceTier::Standard)),
+            ("standard", Some(ServiceTier::Standard)),
+            ("fast", Some(ServiceTier::Fast)),
+            ("priority", Some(ServiceTier::Fast)),
+            ("auto", None),
+            ("flex", None),
+            ("provider_experimental", None),
+        ];
+
+        for (service_tier, expected) in cases {
+            let response: CompletionResponse =
+                serde_json::from_value(response_with_service_tier(service_tier))
+                    .expect("response should deserialize");
+
+            assert_eq!(response.service_tier(), expected, "{service_tier}");
+        }
+
+        let response: CompletionResponse = serde_json::from_value(json!({
+            "id": "resp_123",
+            "object": "response",
+            "created_at": 0,
+            "status": "completed",
+            "model": "gpt-5.4",
+            "output": [],
+        }))
+        .expect("response without a service tier should deserialize");
+
+        assert_eq!(response.service_tier(), None);
+    }
+
+    #[test]
     fn service_tier_serializes_expected_strings() {
         let cases = [
             (OpenAIServiceTier::Auto, "auto"),
             (OpenAIServiceTier::Default, "default"),
             (OpenAIServiceTier::Flex, "flex"),
+            (OpenAIServiceTier::Fast, "fast"),
             (OpenAIServiceTier::Priority, "priority"),
             (OpenAIServiceTier::Standard, "standard"),
         ];

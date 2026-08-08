@@ -5,15 +5,15 @@ use crate::providers::anthropic::streaming::StreamingCompletionResponse;
 use crate::{
     OneOrMany,
     client::Provider,
-    completion::{self, CompletionError, GetTokenUsage},
-    http_client::HttpClientExt,
+    completion::{self, CompletionError, GetServiceTier, GetTokenUsage, ServiceTier},
+    http_client::{self, HttpClientExt},
     message::{self, DocumentMediaType, DocumentSourceKind, MessageError, MimeType, Reasoning},
     one_or_many::string_or_one_or_many,
     telemetry::{ProviderResponseExt, SpanCombinator},
     wasm_compat::*,
 };
 use bytes::Bytes;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{convert::Infallible, str::FromStr};
 use tracing::{Instrument, Level, enabled, info_span};
 
@@ -65,6 +65,16 @@ pub struct CompletionResponse {
     pub usage: Usage,
 }
 
+impl GetServiceTier for CompletionResponse {
+    fn service_tier(&self) -> Option<ServiceTier> {
+        match self.usage.speed.as_ref()? {
+            AnthropicSpeed::Standard => Some(ServiceTier::Standard),
+            AnthropicSpeed::Fast => Some(ServiceTier::Fast),
+            AnthropicSpeed::Other(_) => None,
+        }
+    }
+}
+
 impl ProviderResponseExt for CompletionResponse {
     type OutputMessage = Content;
     type Usage = Usage;
@@ -109,6 +119,42 @@ pub struct Usage {
     pub cache_read_input_tokens: Option<u64>,
     pub cache_creation_input_tokens: Option<u64>,
     pub output_tokens: u64,
+    #[serde(default)]
+    pub speed: Option<AnthropicSpeed>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AnthropicSpeed {
+    Standard,
+    Fast,
+    Other(String),
+}
+
+impl Serialize for AnthropicSpeed {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(match self {
+            Self::Standard => "standard",
+            Self::Fast => "fast",
+            Self::Other(value) => value,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for AnthropicSpeed {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "standard" => Self::Standard,
+            "fast" => Self::Fast,
+            _ => Self::Other(value),
+        })
+    }
 }
 
 impl std::fmt::Display for Usage {
@@ -1471,41 +1517,44 @@ where
                 .await
                 .map_err(CompletionError::HttpError)?;
 
-            if response.status().is_success() {
-                match serde_json::from_slice::<ApiResponse<CompletionResponse>>(
-                    response
-                        .into_body()
-                        .await
-                        .map_err(CompletionError::HttpError)?
-                        .to_vec()
-                        .as_slice(),
-                )? {
-                    ApiResponse::Message(completion) => {
-                        let span = tracing::Span::current();
-                        span.record_response_metadata(&completion);
-                        span.record_token_usage(&completion.usage);
-                        if enabled!(Level::TRACE) {
-                            tracing::trace!(
-                                target: "rig::completions",
-                                "Anthropic completion response: {}",
-                                serde_json::to_string_pretty(&completion)?
-                            );
-                        }
-                        completion.try_into()
+            if !response.status().is_success() {
+                let status = response.status();
+                let headers = response.headers().clone();
+                let body = response
+                    .into_body()
+                    .await
+                    .map_err(CompletionError::HttpError)?;
+                return Err(CompletionError::HttpError(http_client::status_error(
+                    status,
+                    &headers,
+                    String::from_utf8_lossy(&body).into_owned(),
+                )));
+            }
+
+            match serde_json::from_slice::<ApiResponse<CompletionResponse>>(
+                response
+                    .into_body()
+                    .await
+                    .map_err(CompletionError::HttpError)?
+                    .to_vec()
+                    .as_slice(),
+            )? {
+                ApiResponse::Message(completion) => {
+                    let span = tracing::Span::current();
+                    span.record_response_metadata(&completion);
+                    span.record_token_usage(&completion.usage);
+                    if enabled!(Level::TRACE) {
+                        tracing::trace!(
+                            target: "rig::completions",
+                            "Anthropic completion response: {}",
+                            serde_json::to_string_pretty(&completion)?
+                        );
                     }
-                    ApiResponse::Error(ApiErrorResponse { message }) => {
-                        Err(CompletionError::ResponseError(message))
-                    }
+                    completion.try_into()
                 }
-            } else {
-                let text: String = String::from_utf8_lossy(
-                    &response
-                        .into_body()
-                        .await
-                        .map_err(CompletionError::HttpError)?,
-                )
-                .into();
-                Err(CompletionError::ProviderError(text))
+                ApiResponse::Error(ApiErrorResponse { message }) => {
+                    Err(CompletionError::ResponseError(message))
+                }
             }
         }
         .instrument(span)
@@ -1538,8 +1587,182 @@ enum ApiResponse<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        client::CompletionClient,
+        completion::{CompletionModel as _, GetServiceTier, ServiceTier},
+        http_client,
+        providers::anthropic,
+    };
+    use axum::{Router, body::Body, routing::post};
+    use http::{StatusCode, header};
     use serde_json::json;
     use serde_path_to_error::deserialize;
+
+    async fn status_server(status: StatusCode, retry_after: Option<&str>) -> String {
+        let retry_after = retry_after.map(str::to_owned);
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move || {
+                let retry_after = retry_after.clone();
+                async move {
+                    let mut response = axum::response::Response::new(Body::from(
+                        r#"{"type":"error","error":{"type":"rate_limit_error","message":"fast limit reached"}}"#,
+                    ));
+                    *response.status_mut() = status;
+                    response.headers_mut().insert(
+                        header::CONTENT_TYPE,
+                        header::HeaderValue::from_static("application/json"),
+                    );
+                    if let Some(retry_after) = retry_after {
+                        response.headers_mut().insert(
+                            header::RETRY_AFTER,
+                            header::HeaderValue::from_str(&retry_after)
+                                .expect("test retry-after header should be valid"),
+                        );
+                    }
+                    response
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let address = listener
+            .local_addr()
+            .expect("test server should have a local address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should run");
+        });
+
+        format!("http://{address}")
+    }
+
+    async fn chunked_status_server() -> String {
+        let app = Router::new().route(
+            "/v1/messages",
+            post(|| async {
+                let chunks = [
+                    Ok::<_, Infallible>(Bytes::from(vec![b'a'; 8_191])),
+                    Ok(Bytes::from_static("€tail".as_bytes())),
+                ];
+                let mut response =
+                    axum::response::Response::new(Body::from_stream(futures::stream::iter(chunks)));
+                *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+                response
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let address = listener
+            .local_addr()
+            .expect("test server should have a local address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should run");
+        });
+
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn anthropic_completion_preserves_rate_limit_status_and_retry_after() {
+        let base_url = status_server(StatusCode::TOO_MANY_REQUESTS, Some("17")).await;
+        let client = anthropic::Client::builder()
+            .api_key("test-key")
+            .base_url(base_url)
+            .build()
+            .expect("test client should build");
+        let model = client.completion_model(CLAUDE_SONNET_4_6);
+        let request = model.completion_request("hello").max_tokens(4).build();
+
+        let error = model
+            .completion(request)
+            .await
+            .expect_err("rate-limit response should fail");
+
+        assert!(!format!("{error}").contains("fast limit reached"));
+        assert!(!format!("{error:?}").contains("fast limit reached"));
+
+        match error {
+            crate::completion::CompletionError::HttpError(http_client::Error::Status {
+                status,
+                retry_after_secs,
+                message,
+            }) => {
+                assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+                assert_eq!(retry_after_secs, Some(17));
+                assert!(message.len() <= 8 * 1024);
+                assert!(message.contains("fast limit reached"));
+            }
+            other => panic!("expected structured HTTP error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_completion_rejects_non_success_response_from_custom_client() {
+        let http_client = crate::test_utils::RecordingHttpClient::with_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"type":"error","error":{"type":"rate_limit_error","message":"custom fast limit"}}"#,
+        );
+        let client = anthropic::Client::builder()
+            .http_client(http_client)
+            .api_key("test-key")
+            .build()
+            .expect("test client should build");
+        let model = client.completion_model(CLAUDE_SONNET_4_6);
+        let request = model.completion_request("hello").max_tokens(4).build();
+
+        let error = model
+            .completion(request)
+            .await
+            .expect_err("non-success custom response should fail as HTTP status");
+
+        match error {
+            crate::completion::CompletionError::HttpError(http_client::Error::Status {
+                status,
+                retry_after_secs,
+                message,
+            }) => {
+                assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+                assert_eq!(retry_after_secs, None);
+                assert!(message.contains("custom fast limit"));
+            }
+            other => panic!("expected structured HTTP error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_completion_bounds_chunked_utf8_status_body() {
+        let base_url = chunked_status_server().await;
+        let client = anthropic::Client::builder()
+            .api_key("test-key")
+            .base_url(base_url)
+            .build()
+            .expect("test client should build");
+        let model = client.completion_model(CLAUDE_SONNET_4_6);
+        let request = model.completion_request("hello").max_tokens(4).build();
+
+        let error = model
+            .completion(request)
+            .await
+            .expect_err("oversized status response should fail");
+
+        match error {
+            crate::completion::CompletionError::HttpError(http_client::Error::Status {
+                message,
+                ..
+            }) => {
+                assert!(message.is_char_boundary(message.len()));
+                assert!(message.len() <= 8 * 1024);
+                assert_eq!(message, "a".repeat(8_191));
+            }
+            other => panic!("expected structured HTTP error, got {other:?}"),
+        }
+    }
 
     #[test]
     fn current_model_default_max_tokens_match_anthropic_limits() {
@@ -1556,6 +1779,38 @@ mod tests {
     fn unknown_model_uses_conservative_default_max_tokens_fallback() {
         assert_eq!(default_max_tokens_for_model("claude-unknown"), None);
         assert_eq!(default_max_tokens_with_fallback("claude-unknown"), 2_048);
+    }
+
+    #[test]
+    fn completion_response_reports_service_tier_from_usage_speed() {
+        let cases = [
+            (Some("standard"), Some(ServiceTier::Standard)),
+            (Some("fast"), Some(ServiceTier::Fast)),
+            (Some("experimental"), None),
+            (None, None),
+        ];
+
+        for (speed, expected) in cases {
+            let mut usage = json!({
+                "input_tokens": 1,
+                "output_tokens": 1,
+            });
+            if let Some(speed) = speed {
+                usage["speed"] = json!(speed);
+            }
+            let response: CompletionResponse = serde_json::from_value(json!({
+                "content": [],
+                "id": "msg_123",
+                "model": "claude-sonnet-5",
+                "role": "assistant",
+                "stop_reason": "end_turn",
+                "stop_sequence": null,
+                "usage": usage,
+            }))
+            .expect("response should deserialize");
+
+            assert_eq!(response.service_tier(), expected, "{speed:?}");
+        }
     }
 
     #[test]
@@ -2471,6 +2726,7 @@ mod tests {
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
                 output_tokens: 2,
+                speed: None,
             },
         };
 
@@ -2499,6 +2755,7 @@ mod tests {
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
                 output_tokens: 2,
+                speed: None,
             },
         };
 

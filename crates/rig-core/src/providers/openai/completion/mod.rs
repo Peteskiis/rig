@@ -1567,18 +1567,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::{ImageDetail, ImageMediaType, ToolResult, ToolResultContent};
+    use crate::message::{ImageMediaType, ToolResult, ToolResultContent};
     use crate::telemetry::ProviderResponseExt;
 
     #[test]
     fn image_tool_result_becomes_correlated_result_then_user_image() {
         let content = OneOrMany::many(vec![
             ToolResultContent::text("screenshot"),
-            ToolResultContent::image_base64(
-                "AQID",
-                Some(ImageMediaType::PNG),
-                Some(ImageDetail::Auto),
-            ),
+            ToolResultContent::image_base64("AQID", Some(ImageMediaType::PNG), None),
         ])
         .expect("non-empty tool result");
         let input = OneOrMany::one(message::UserContent::ToolResult(ToolResult {
@@ -1595,6 +1591,7 @@ mod tests {
         assert_eq!(json[0]["content"], "screenshot");
         assert_eq!(json[1]["role"], "user");
         assert_eq!(json[1]["content"][0]["type"], "image_url");
+        assert_eq!(json[1]["content"][0]["image_url"]["detail"], "auto");
         assert_eq!(
             json[1]["content"][0]["image_url"]["url"],
             "data:image/png;base64,AQID"

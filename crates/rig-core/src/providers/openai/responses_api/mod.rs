@@ -1988,7 +1988,7 @@ mod tests {
     use super::*;
     use crate::completion::{GetServiceTier, ServiceTier};
     use crate::message;
-    use crate::message::{ImageDetail, ImageMediaType, ToolResult, ToolResultContent};
+    use crate::message::{ImageMediaType, ToolResult, ToolResultContent};
     use serde_json::json;
 
     #[test]
@@ -2034,11 +2034,7 @@ mod tests {
     fn image_tool_result_becomes_correlated_output_then_user_image() {
         let content = OneOrMany::many(vec![
             ToolResultContent::text("screenshot"),
-            ToolResultContent::image_base64(
-                "AQID",
-                Some(ImageMediaType::PNG),
-                Some(ImageDetail::Auto),
-            ),
+            ToolResultContent::image_base64("AQID", Some(ImageMediaType::PNG), None),
         ])
         .expect("non-empty tool result");
         let input = completion::Message::User {
@@ -2058,6 +2054,7 @@ mod tests {
         assert_eq!(json[1]["type"], "message");
         assert_eq!(json[1]["role"], "user");
         assert_eq!(json[1]["content"][0]["type"], "input_image");
+        assert_eq!(json[1]["content"][0]["detail"], "auto");
         assert_eq!(
             json[1]["content"][0]["image_url"],
             "data:image/png;base64,AQID"

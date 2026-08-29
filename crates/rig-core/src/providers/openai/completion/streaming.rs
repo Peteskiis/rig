@@ -104,7 +104,7 @@ where
             strict_tools: self.strict_tools,
             tool_result_array_content: self.tool_result_array_content,
         })?;
-        let request_messages = serde_json::to_string(&request.messages)?;
+        let request_messages = crate::providers::json_with_redacted_images(&request.messages)?;
         let mut request_as_json = serde_json::to_value(request)?;
 
         request_as_json = merge(
@@ -116,7 +116,7 @@ where
             tracing::trace!(
                 target: "rig::completions",
                 "OpenAI Chat Completions streaming completion request: {}",
-                serde_json::to_string_pretty(&request_as_json)?
+                crate::providers::json_with_redacted_images(&request_as_json)?
             );
         }
 

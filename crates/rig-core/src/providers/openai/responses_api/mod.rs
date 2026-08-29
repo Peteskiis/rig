@@ -1503,7 +1503,7 @@ where
             tracing::trace!(
                 target: "rig::completions",
                 "OpenAI Responses completion request: {request}",
-                request = serde_json::to_string_pretty(&request)?
+                request = crate::providers::json_with_redacted_images(&request)?
             );
         }
 

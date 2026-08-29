@@ -287,6 +287,7 @@ impl TryFrom<crate::completion::Message> for Vec<InputItem> {
             }]),
             crate::completion::Message::User { content } => {
                 let mut items = Vec::new();
+                let mut tool_result_images = Vec::new();
 
                 for user_content in content {
                     match user_content {
@@ -306,24 +307,35 @@ impl TryFrom<crate::completion::Message> for Vec<InputItem> {
                                 ..
                             },
                         ) => {
+                            let call_id = require_call_id(call_id, "Tool result")?;
+                            let mut text = Vec::new();
+                            let mut images = Vec::new();
                             for tool_result_content in tool_content {
-                                let crate::completion::message::ToolResultContent::Text(Text {
-                                    text,
-                                }) = tool_result_content
-                                else {
-                                    return Err(CompletionError::ProviderError(
-                                        "This thing only supports text!".to_string(),
-                                    ));
-                                };
-                                // let output = serde_json::from_str(&text)?;
-                                items.push(InputItem {
-                                    role: None,
-                                    input: InputContent::FunctionCallOutput(ToolResult {
-                                        call_id: require_call_id(call_id.clone(), "Tool result")?,
-                                        output: text,
-                                        status: ToolStatus::Completed,
-                                    }),
-                                });
+                                match tool_result_content {
+                                    crate::completion::message::ToolResultContent::Text(Text {
+                                        text: value,
+                                    }) => text.push(value),
+                                    crate::completion::message::ToolResultContent::Image(image) => {
+                                        images.push(image);
+                                    }
+                                }
+                            }
+                            items.push(InputItem {
+                                role: None,
+                                input: InputContent::FunctionCallOutput(ToolResult {
+                                    call_id,
+                                    output: text.join("\n"),
+                                    status: ToolStatus::Completed,
+                                }),
+                            });
+                            for image in images {
+                                tool_result_images.extend(Vec::<InputItem>::try_from(
+                                    crate::completion::Message::User {
+                                        content: OneOrMany::one(
+                                            crate::message::UserContent::Image(image),
+                                        ),
+                                    },
+                                )?);
                             }
                         }
                         crate::message::UserContent::Document(Document {
@@ -435,6 +447,7 @@ impl TryFrom<crate::completion::Message> for Vec<InputItem> {
                     }
                 }
 
+                items.extend(tool_result_images);
                 Ok(items)
             }
             crate::completion::Message::Assistant { id, content } => {
@@ -1490,7 +1503,7 @@ where
             tracing::trace!(
                 target: "rig::completions",
                 "OpenAI Responses completion request: {request}",
-                request = serde_json::to_string_pretty(&request)?
+                request = crate::providers::json_with_redacted_images(&request)?
             );
         }
 
@@ -1975,6 +1988,7 @@ mod tests {
     use super::*;
     use crate::completion::{GetServiceTier, ServiceTier};
     use crate::message;
+    use crate::message::{ImageMediaType, ToolResult, ToolResultContent};
     use serde_json::json;
 
     #[test]
@@ -2014,6 +2028,37 @@ mod tests {
         );
         // 3) `required` was NOT rewritten to every key — `data` stays optional.
         assert_eq!(responses_tool.parameters["required"], json!(["target"]));
+    }
+
+    #[test]
+    fn image_tool_result_becomes_correlated_output_then_user_image() {
+        let content = OneOrMany::many(vec![
+            ToolResultContent::text("screenshot"),
+            ToolResultContent::image_base64("AQID", Some(ImageMediaType::PNG), None),
+        ])
+        .expect("non-empty tool result");
+        let input = completion::Message::User {
+            content: OneOrMany::one(message::UserContent::ToolResult(ToolResult {
+                id: "fc_1".to_string(),
+                call_id: Some("call_1".to_string()),
+                content,
+            })),
+        };
+
+        let converted: Vec<InputItem> = input.try_into().expect("conversion should succeed");
+        let json = serde_json::to_value(converted).expect("items should serialize");
+
+        assert_eq!(json[0]["type"], "function_call_output");
+        assert_eq!(json[0]["call_id"], "call_1");
+        assert_eq!(json[0]["output"], "screenshot");
+        assert_eq!(json[1]["type"], "message");
+        assert_eq!(json[1]["role"], "user");
+        assert_eq!(json[1]["content"][0]["type"], "input_image");
+        assert_eq!(json[1]["content"][0]["detail"], "auto");
+        assert_eq!(
+            json[1]["content"][0]["image_url"],
+            "data:image/png;base64,AQID"
+        );
     }
 
     fn response_with_service_tier(service_tier: &str) -> Value {

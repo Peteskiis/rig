@@ -292,7 +292,7 @@ where
             tracing::trace!(
                 target: "rig::completions",
                 "Anthropic completion request: {}",
-                serde_json::to_string_pretty(&body)?
+                crate::providers::json_with_redacted_images(&body)?
             );
         }
 

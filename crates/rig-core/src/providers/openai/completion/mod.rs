@@ -477,6 +477,30 @@ impl TryFrom<message::ToolResult> for Message {
     }
 }
 
+fn tool_result_to_message_and_images(
+    value: message::ToolResult,
+) -> Result<(Message, Vec<UserContent>), message::MessageError> {
+    let mut text = Vec::new();
+    let mut images = Vec::new();
+
+    for content in value.content {
+        match content {
+            message::ToolResultContent::Text(message::Text { text: value }) => text.push(value),
+            message::ToolResultContent::Image(image) => {
+                images.push(UserContent::try_from(message::UserContent::Image(image))?);
+            }
+        }
+    }
+
+    Ok((
+        Message::ToolResult {
+            tool_call_id: value.id,
+            content: ToolResultContentValue::String(text.join("\n")),
+        },
+        images,
+    ))
+}
+
 impl TryFrom<message::UserContent> for UserContent {
     type Error = message::MessageError;
 
@@ -622,15 +646,30 @@ impl TryFrom<OneOrMany<message::UserContent>> for Vec<Message> {
         // If there are messages with both tool results and user content, openai will only
         //  handle tool results. It's unlikely that there will be both.
         if !tool_results.is_empty() {
-            tool_results
-                .into_iter()
-                .map(|content| match content {
-                    message::UserContent::ToolResult(tool_result) => tool_result.try_into(),
-                    _ => Err(message::MessageError::ConversionError(
+            let mut messages = Vec::new();
+            let mut images = Vec::new();
+            for content in tool_results {
+                let message::UserContent::ToolResult(tool_result) = content else {
+                    return Err(message::MessageError::ConversionError(
                         "expected tool result content while converting OpenAI input".into(),
-                    )),
-                })
-                .collect::<Result<Vec<_>, _>>()
+                    ));
+                };
+                let (message, result_images) = tool_result_to_message_and_images(tool_result)?;
+                messages.push(message);
+                images.extend(result_images);
+            }
+            if !images.is_empty() {
+                let content = OneOrMany::many(images).map_err(|_| {
+                    message::MessageError::ConversionError(
+                        "OpenAI tool-result image projection was unexpectedly empty".into(),
+                    )
+                })?;
+                messages.push(Message::User {
+                    content,
+                    name: None,
+                });
+            }
+            Ok(messages)
         } else {
             let other_content: Vec<UserContent> = other_content
                 .into_iter()
@@ -1455,7 +1494,7 @@ where
             tracing::trace!(
                 target: "rig::completions",
                 "OpenAI Chat Completions completion request: {}",
-                serde_json::to_string_pretty(&request)?
+                crate::providers::json_with_redacted_images(&request)?
             );
         }
 
@@ -1528,7 +1567,36 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::{ImageMediaType, ToolResult, ToolResultContent};
     use crate::telemetry::ProviderResponseExt;
+
+    #[test]
+    fn image_tool_result_becomes_correlated_result_then_user_image() {
+        let content = OneOrMany::many(vec![
+            ToolResultContent::text("screenshot"),
+            ToolResultContent::image_base64("AQID", Some(ImageMediaType::PNG), None),
+        ])
+        .expect("non-empty tool result");
+        let input = OneOrMany::one(message::UserContent::ToolResult(ToolResult {
+            id: "fc_1".to_string(),
+            call_id: Some("call_1".to_string()),
+            content,
+        }));
+
+        let converted: Vec<Message> = input.try_into().expect("conversion should succeed");
+        let json = serde_json::to_value(converted).expect("messages should serialize");
+
+        assert_eq!(json[0]["role"], "tool");
+        assert_eq!(json[0]["tool_call_id"], "fc_1");
+        assert_eq!(json[0]["content"], "screenshot");
+        assert_eq!(json[1]["role"], "user");
+        assert_eq!(json[1]["content"][0]["type"], "image_url");
+        assert_eq!(json[1]["content"][0]["image_url"]["detail"], "auto");
+        assert_eq!(
+            json[1]["content"][0]["image_url"]["url"],
+            "data:image/png;base64,AQID"
+        );
+    }
 
     #[test]
     fn test_openai_request_uses_request_model_override() {

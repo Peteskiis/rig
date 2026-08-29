@@ -91,3 +91,67 @@ pub mod voyageai;
 pub mod xai;
 pub mod xiaomimimo;
 pub mod zai;
+
+pub(crate) fn json_with_redacted_images(
+    value: &impl serde::Serialize,
+) -> Result<String, serde_json::Error> {
+    let mut value = serde_json::to_value(value)?;
+    redact_image_payloads(&mut value, false);
+    serde_json::to_string_pretty(&value)
+}
+
+fn redact_image_payloads(value: &mut serde_json::Value, image_context: bool) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            let image_context = image_context
+                || fields
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|kind| matches!(kind, "image" | "image_url" | "input_image"));
+            for (name, child) in fields {
+                let nested_image_object = name == "image_url" && child.is_object();
+                if image_context
+                    && !nested_image_object
+                    && matches!(name.as_str(), "data" | "url" | "image_url")
+                {
+                    *child = serde_json::Value::String("<redacted-image>".into());
+                } else {
+                    redact_image_payloads(child, image_context);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_image_payloads(item, image_context);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use serde_json::json;
+
+    #[test]
+    fn image_payloads_are_redacted_without_hiding_safe_metadata() {
+        let request = json!({
+            "content": [
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/png", "data": "SECRET_1"
+                }},
+                {"type": "image_url", "image_url": {"url": "SECRET_2", "detail": "high"}},
+                {"type": "input_image", "image_url": "SECRET_3"},
+                {"type": "text", "text": "keep me"}
+            ]
+        });
+
+        let output = super::json_with_redacted_images(&request).unwrap();
+
+        assert!(!output.contains("SECRET"));
+        assert!(output.contains("<redacted-image>"));
+        assert!(output.contains("image/png"));
+        assert!(output.contains("high"));
+        assert!(output.contains("keep me"));
+    }
+}

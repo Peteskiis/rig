@@ -122,6 +122,8 @@ struct ThinkingState {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct StreamingCompletionResponse {
     pub usage: PartialUsage,
+    /// Provider terminal reason, including `refusal` and `max_tokens`.
+    pub stop_reason: Option<String>,
 }
 
 impl GetTokenUsage for StreamingCompletionResponse {
@@ -313,6 +315,7 @@ where
             let mut sse_stream = Box::pin(stream);
             let mut input_tokens = 0;
             let mut final_usage = None;
+            let mut stop_reason = None;
 
             let mut text_content = String::new();
 
@@ -347,6 +350,7 @@ where
                                             let span = tracing::Span::current();
                                             span.record_token_usage(&usage);
                                             final_usage = Some(usage);
+                                            stop_reason = delta.stop_reason.clone();
                                             break;
                                         }
                                     }
@@ -380,7 +384,8 @@ where
             sse_stream.close();
 
             yield Ok(RawStreamingChoice::FinalResponse(StreamingCompletionResponse {
-                usage: final_usage.unwrap_or_default()
+                usage: final_usage.unwrap_or_default(),
+                stop_reason,
             }))
         }.instrument(span));
 
@@ -603,8 +608,9 @@ mod tests {
         }
     }
 
-    async fn final_response_from_terminal_speed(
+    async fn final_response_from_terminal(
         speed: Option<&str>,
+        stop_reason: &str,
     ) -> StreamingCompletionResponse {
         let mut terminal_usage = json!({ "output_tokens": 2 });
         if let Some(speed) = speed {
@@ -625,7 +631,7 @@ mod tests {
             }),
             json!({
                 "type": "message_delta",
-                "delta": { "stop_reason": "end_turn", "stop_sequence": null },
+                "delta": { "stop_reason": stop_reason, "stop_sequence": null },
                 "usage": terminal_usage,
             }),
         ];
@@ -660,9 +666,21 @@ mod tests {
         ];
 
         for (speed, expected) in cases {
-            let response = final_response_from_terminal_speed(speed).await;
+            let response = final_response_from_terminal(speed, "end_turn").await;
 
             assert_eq!(response.service_tier(), expected, "{speed:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_message_delta_preserves_stop_reason_and_usage() {
+        for reason in ["refusal", "max_tokens", "tool_use", "end_turn"] {
+            let response = final_response_from_terminal(None, reason).await;
+            let encoded = serde_json::to_value(&response).expect("serializable response");
+            assert_eq!(encoded["stop_reason"], reason);
+            let usage = response.token_usage().expect("terminal usage");
+            assert_eq!(usage.input_tokens, 3);
+            assert_eq!(usage.output_tokens, 2);
         }
     }
 

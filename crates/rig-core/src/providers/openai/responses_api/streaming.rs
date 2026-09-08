@@ -713,7 +713,7 @@ where
                 Err(error) => {
                     tracing::error!(?error, "SSE error");
                     terminated_with_error = true;
-                    yield Err(CompletionError::ProviderError(error.to_string()));
+                    yield Err(CompletionError::HttpError(error));
                     break;
                 }
             }
@@ -951,6 +951,30 @@ mod tests {
         client::CompletionClient, completion::Message, providers::openai, streaming::StreamingChat,
         test_utils::MockExampleTool,
     };
+
+    #[tokio::test]
+    async fn streaming_transport_errors_remain_typed() {
+        let client = openai::Client::builder()
+            .http_client(crate::test_utils::RecordingHttpClient::default())
+            .api_key("test-key")
+            .build()
+            .expect("client should build");
+        let model = client.completion_model("gpt-5.4");
+        let request = model.completion_request("hello").build();
+        let mut stream = model.stream(request).await.expect("stream should start");
+        let error = stream
+            .next()
+            .await
+            .expect("error item")
+            .expect_err("transport error");
+        assert!(matches!(
+            error,
+            crate::completion::CompletionError::HttpError(
+                crate::http_client::Error::InvalidStatusCode(http::StatusCode::NOT_IMPLEMENTED)
+            )
+        ));
+        assert!(stream.next().await.is_none());
+    }
 
     fn sample_response(status: ResponseStatus) -> CompletionResponse {
         CompletionResponse {

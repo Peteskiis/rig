@@ -750,8 +750,6 @@ where
 /// See
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ItemChunk {
-    /// Item ID. Optional.
-    pub item_id: Option<String>,
     /// The output index of the item from a given streamed response.
     pub output_index: u64,
     /// The item type chunk, as well as the inner data.
@@ -780,7 +778,7 @@ pub enum ItemChunkKind {
     #[serde(rename = "response.refusal.done")]
     RefusalDone(RefusalTextChunk),
     #[serde(rename = "response.function_call_arguments.delta")]
-    FunctionCallArgsDelta(DeltaTextChunkWithItemId),
+    FunctionCallArgsDelta(FunctionCallArgsDeltaChunk),
     #[serde(rename = "response.function_call_arguments.done")]
     FunctionCallArgsDone(ArgsTextChunk),
     #[serde(rename = "response.reasoning_summary_part.added")]
@@ -824,11 +822,14 @@ pub struct DeltaTextChunk {
     pub delta: String,
 }
 
+/// Incremental function arguments. Unlike text content, these have no content index.
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct DeltaTextChunkWithItemId {
+pub struct FunctionCallArgsDeltaChunk {
+    /// Output item identity, owned here rather than by the flattened envelope.
     pub item_id: String,
-    pub content_index: u64,
+    /// Event sequence number.
     pub sequence_number: u64,
+    /// Raw argument fragment, which need not be valid JSON on its own.
     pub delta: String,
 }
 
@@ -848,9 +849,10 @@ pub struct RefusalTextChunk {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ArgsTextChunk {
-    pub content_index: u64,
+    /// Output item whose function arguments are complete.
+    pub item_id: String,
     pub sequence_number: u64,
-    pub arguments: serde_json::Value,
+    pub arguments: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -930,6 +932,9 @@ where
         Ok(stream_from_event_source(event_source, span, "OpenAI"))
     }
 }
+
+#[cfg(test)]
+mod tool_delta_tests;
 
 #[cfg(test)]
 mod tests {

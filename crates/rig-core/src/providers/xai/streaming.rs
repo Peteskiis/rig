@@ -96,11 +96,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::send_xai_streaming_request;
+    use crate::completion::GetTokenUsage;
     use crate::message::ReasoningContent;
     use crate::providers::internal::openai_chat_completions_compatible::test_support::sse_bytes_from_json_events;
     use crate::providers::openai::responses_api::ReasoningSummary;
     use crate::providers::openai::responses_api::streaming::reasoning_choices_from_done_item;
     use crate::streaming::{RawStreamingChoice, StreamedAssistantContent};
+    use crate::test_utils::MockStreamingClient;
+    use futures::StreamExt;
+    use serde_json::json;
 
     #[test]
     fn reasoning_done_item_emits_summary_then_encrypted() {
@@ -140,10 +144,6 @@ mod tests {
 
     #[tokio::test]
     async fn xai_stream_surfaces_terminal_errors_after_completed_tool_calls() {
-        use crate::test_utils::MockStreamingClient;
-        use futures::StreamExt;
-        use serde_json::json;
-
         let tool_call_done = json!({
             "type": "response.output_item.done",
             "output_index": 0,
@@ -221,5 +221,44 @@ mod tests {
             stream.next().await.is_none(),
             "stream should terminate immediately after the first terminal error"
         );
+    }
+    #[tokio::test]
+    async fn nullable_echoed_tool_fields_preserve_terminal_usage() {
+        let event = json!({
+            "type":"response.completed", "sequence_number":1,
+            "response":{
+                "id":"resp_grok", "object":"response", "created_at":0,
+                "status":"completed", "model":"grok-4.7", "output":[],
+                "tools":[{"type":"function", "name":"weather",
+                    "description":null, "strict":null, "parameters":{"type":"object"}}],
+                "usage":{"input_tokens":200_000,
+                    "input_tokens_details":{"cached_tokens":1_000},
+                    "output_tokens":1_000, "output_tokens_details":{"reasoning_tokens":900},
+                    "total_tokens":201_000}
+            }
+        });
+        let client = MockStreamingClient {
+            sse_bytes: sse_bytes_from_json_events(&[event]),
+        };
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("http://localhost/v1/responses")
+            .body(Vec::new())
+            .unwrap_or_else(|error| panic!("request fixture: {error}"));
+        let mut stream = send_xai_streaming_request(client, request)
+            .await
+            .unwrap_or_else(|error| panic!("stream: {error}"));
+        let mut usage = None;
+        while let Some(item) = stream.next().await {
+            if let StreamedAssistantContent::Final(response) =
+                item.unwrap_or_else(|error| panic!("stream item: {error}"))
+            {
+                usage = response.token_usage();
+            }
+        }
+        let usage = usage.unwrap_or_else(|| panic!("terminal usage missing"));
+        assert_eq!(usage.input_tokens, 200_000);
+        assert_eq!(usage.cached_input_tokens, 1_000);
+        assert_eq!(usage.output_tokens, 1_000);
     }
 }

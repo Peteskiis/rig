@@ -572,14 +572,32 @@ pub struct ResponsesToolDefinition {
     #[serde(default, skip_serializing_if = "is_json_null")]
     pub parameters: serde_json::Value,
     /// Whether to use strict mode. Enabled by default as it allows for improved efficiency.
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(
+        default,
+        deserialize_with = "default_on_null",
+        skip_serializing_if = "is_false"
+    )]
     pub strict: bool,
     /// Tool description.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "default_on_null",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub description: String,
     /// Additional provider-specific configuration for hosted tools.
     #[serde(flatten, default, skip_serializing_if = "Map::is_empty")]
     pub config: Map<String, Value>,
+}
+
+// xAI echoes unset optional tool fields as null on response.completed.
+// They have the same meaning as absent fields; reject other invalid types.
+fn default_on_null<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Option::<T>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 fn is_json_null(value: &Value) -> bool {
@@ -1990,6 +2008,39 @@ mod tests {
     use crate::message;
     use crate::message::{ImageMediaType, ToolResult, ToolResultContent};
     use serde_json::json;
+
+    #[test]
+    fn response_tool_optional_fields_accept_null_without_changing_request_serialization() {
+        for extras in [
+            json!({}),
+            json!({"strict":null, "description":null}),
+            json!({"strict":false, "description":""}),
+        ] {
+            let value =
+                crate::json_utils::merge(json!({"type":"function", "name":"weather"}), extras);
+            let tool: ResponsesToolDefinition = serde_json::from_value(value)
+                .unwrap_or_else(|error| panic!("tool fixture: {error}"));
+            assert!(!tool.strict);
+            assert!(tool.description.is_empty());
+            let wire = serde_json::to_value(tool)
+                .unwrap_or_else(|error| panic!("tool serialization: {error}"));
+            assert!(wire.get("strict").is_none());
+            assert!(wire.get("description").is_none());
+        }
+        let tool: ResponsesToolDefinition = serde_json::from_value(json!({
+            "type":"function", "name":"weather", "strict":true, "description":"Weather lookup"
+        }))
+        .unwrap_or_else(|error| panic!("tool fixture: {error}"));
+        let wire = serde_json::to_value(tool)
+            .unwrap_or_else(|error| panic!("tool serialization: {error}"));
+        assert_eq!(wire["strict"], true);
+        assert_eq!(wire["description"], "Weather lookup");
+        for invalid in [json!({"strict":"yes"}), json!({"description":42})] {
+            let value =
+                crate::json_utils::merge(json!({"type":"function", "name":"weather"}), invalid);
+            assert!(serde_json::from_value::<ResponsesToolDefinition>(value).is_err());
+        }
+    }
 
     #[test]
     fn proxied_tool_def_is_non_strict_and_preserves_open_map() {

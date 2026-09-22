@@ -29,7 +29,7 @@ pub enum Message {
         arguments: String,
     },
     /// A function call output/result
-    FunctionCallOutput { call_id: String, output: String },
+    FunctionCallOutput { call_id: String, output: Content },
     /// A reasoning item returned by xAI/OpenAI-compatible Responses APIs.
     Reasoning {
         id: String,
@@ -112,7 +112,7 @@ impl Message {
         }
     }
 
-    pub fn function_call_output(call_id: String, output: String) -> Self {
+    pub fn function_call_output(call_id: String, output: Content) -> Self {
         Self::FunctionCallOutput { call_id, output }
     }
 
@@ -251,19 +251,17 @@ impl TryFrom<RigMessage> for Vec<Message> {
                             has_images = false;
 
                             // Tool result becomes FunctionCallOutput
-                            let output = tr
-                                .content
-                                .into_iter()
-                                .map(|tc| match tc {
-                                    ToolResultContent::Text(t) => Ok(t.text),
-                                    ToolResultContent::Image(_) => {
-                                        Err(CompletionError::RequestError(
-                                            "xAI does not support images in tool results".into(),
-                                        ))
-                                    }
-                                })
-                                .collect::<Result<Vec<_>, _>>()?
-                                .join("\n");
+                            let output = Content::Array(
+                                tr.content
+                                    .into_iter()
+                                    .map(|content| match content {
+                                        ToolResultContent::Text(text) => {
+                                            Ok(ContentItem::Text { text: text.text })
+                                        }
+                                        ToolResultContent::Image(image) => image_item(image),
+                                    })
+                                    .collect::<Result<Vec<_>, _>>()?,
+                            );
                             let call_id = tr.call_id.ok_or_else(|| {
                                 CompletionError::RequestError(
                                     "Tool result `call_id` is required for xAI Responses API"
@@ -524,6 +522,37 @@ mod tests {
                 .get("type")
                 .and_then(|value| value.as_str()),
             Some("message")
+        );
+    }
+
+    #[test]
+    fn image_tool_results_preserve_content_order_and_call_correlation() {
+        use crate::message::{ImageMediaType, ToolResult, ToolResultContent, UserContent};
+        let content = OneOrMany::many(vec![
+            ToolResultContent::text("before"),
+            ToolResultContent::image_base64("AQID", Some(ImageMediaType::PNG), None),
+            ToolResultContent::text("after"),
+        ])
+        .unwrap_or_else(|error| panic!("fixture: {error}"));
+        let message = RigMessage::User {
+            content: OneOrMany::one(UserContent::ToolResult(ToolResult {
+                id: "item_observe".into(),
+                call_id: Some("call_observe".into()),
+                content,
+            })),
+        };
+        let items = Vec::<Message>::try_from(message)
+            .unwrap_or_else(|error| panic!("native tool image: {error}"));
+        let wire = serde_json::to_value(items).unwrap_or_else(|error| panic!("wire: {error}"));
+        assert_eq!(
+            wire,
+            serde_json::json!([{
+                "type":"function_call_output", "call_id":"call_observe", "output":[
+                    {"type":"input_text", "text":"before"},
+                    {"type":"input_image", "image_url":"data:image/png;base64,AQID"},
+                    {"type":"input_text", "text":"after"}
+                ]
+            }])
         );
     }
 

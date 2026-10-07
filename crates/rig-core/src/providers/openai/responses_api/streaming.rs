@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{Level, debug, enabled, info_span};
 use tracing_futures::Instrument as _;
 
+use self::diagnostics::StreamDiagnostics;
 use super::{CompletionResponse, GenericResponsesCompletionModel, Output};
 
 type StreamingRawChoice = RawStreamingChoice<StreamingCompletionResponse>;
@@ -657,6 +658,7 @@ where
 {
     let stream = stream! {
         let mut accumulator = RawChoiceAccumulator::new(ResponsesUsage::new());
+        let mut diagnostics = StreamDiagnostics::default();
         let span = tracing::Span::current();
 
         let mut terminated_with_error = false;
@@ -671,6 +673,7 @@ where
                     if evt.data.trim().is_empty() || evt.data == "[DONE]" {
                         continue;
                     }
+                    diagnostics.observe(&evt.data);
 
                     let data = serde_json::from_str::<StreamingCompletionChunk>(&evt.data);
 
@@ -678,6 +681,7 @@ where
                         let Err(err) = data else {
                             continue;
                         };
+                        diagnostics.undecodable();
                         debug!(
                             "Couldn't deserialize SSE data as StreamingCompletionChunk: {:?}",
                             err
@@ -693,13 +697,17 @@ where
                         }
                         StreamingCompletionChunk::Response(chunk) => {
                             let ResponseChunk { kind, response, .. } = *chunk;
-                            if matches!(kind, ResponseChunkKind::ResponseCompleted) {
+                            let completed = matches!(kind, ResponseChunkKind::ResponseCompleted);
+                            if diagnostics.response(&response.id, completed) {
                                 span.record("gen_ai.response.id", response.id.as_str());
+                            }
+                            if completed {
                                 span.record("gen_ai.response.model", response.model.as_str());
                             }
                             if let Err(error) =
                                 accumulator.record_response_chunk(kind, response, provider_name, options)
                             {
+                                diagnostics.log_failure(provider_name, &error);
                                 terminated_with_error = true;
                                 yield Err(error);
                                 break;
@@ -711,7 +719,7 @@ where
                     event_source.close();
                 }
                 Err(error) => {
-                    tracing::error!(?error, "SSE error");
+                    diagnostics.log_failure(provider_name, &format_args!("{error:?}"));
                     terminated_with_error = true;
                     yield Err(CompletionError::HttpError(error));
                     break;
@@ -724,6 +732,7 @@ where
         if terminated_with_error {
             return;
         }
+        diagnostics.log_end(provider_name);
 
         let final_usage = accumulator.final_usage.clone();
 
@@ -933,6 +942,7 @@ where
     }
 }
 
+mod diagnostics;
 #[cfg(test)]
 mod tool_delta_tests;
 

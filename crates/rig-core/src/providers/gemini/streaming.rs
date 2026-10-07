@@ -152,7 +152,13 @@ where
                         let data = match serde_json::from_str::<StreamGenerateContentResponse>(&message.data) {
                             Ok(d) => d,
                             Err(error) => {
-                                tracing::error!(?error, message = message.data, "Failed to parse SSE message");
+                                // The payload is model output; log its shape, never its content.
+                                tracing::error!(
+                                    category = ?error.classify(),
+                                    column = error.column(),
+                                    data_bytes = message.data.len(),
+                                    "Failed to parse SSE message"
+                                );
                                 continue;
                             }
                         };

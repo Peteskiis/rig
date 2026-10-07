@@ -139,13 +139,12 @@ where
                     .await
                     .map_err(CompletionError::HttpError)?;
 
-                let response_text = String::from_utf8_lossy(&response_body).to_string();
-
                 let response: GenerateContentResponse = serde_json::from_slice(&response_body)
                     .map_err(|err| {
                         tracing::error!(
-                            error = %err,
-                            body = %response_text,
+                            category = ?err.classify(),
+                            column = err.column(),
+                            body_bytes = response_body.len(),
                             "Failed to deserialize Gemini completion response"
                         );
                         CompletionError::JsonError(err)

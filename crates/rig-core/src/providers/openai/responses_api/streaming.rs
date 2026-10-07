@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{Level, debug, enabled, info_span};
 use tracing_futures::Instrument as _;
 
+use self::diagnostics::StreamDiagnostics;
 use super::{CompletionResponse, GenericResponsesCompletionModel, Output};
 
 type StreamingRawChoice = RawStreamingChoice<StreamingCompletionResponse>;
@@ -139,6 +140,26 @@ fn response_chunk_error_message(
     }
 }
 
+/// Message of a top-level `{"type":"error"}` stream event, which matches no
+/// [`StreamingCompletionChunk`] shape. Streams carry `code`/`message` at the top
+/// level; buffered bodies nest them under `error`.
+fn stream_error_event_message(data: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(data).ok()?;
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("error") {
+        return None;
+    }
+    let body = value
+        .get("error")
+        .filter(|error| error.is_object())
+        .unwrap_or(&value);
+    let text = |key| body.get(key).and_then(serde_json::Value::as_str);
+    let message = text("message").unwrap_or(data);
+    Some(match text("code").filter(|code| !code.is_empty()) {
+        Some(code) => format!("{code}: {message}"),
+        None => message.to_owned(),
+    })
+}
+
 fn response_error_message(error: Option<&super::ResponseError>, fallback: &str) -> String {
     if let Some(error) = error {
         if error.code.is_empty() {
@@ -248,12 +269,7 @@ pub(crate) fn parse_sse_completion_body(
                     .or_else(|| Some(data.to_string()));
             }
             Some("error") => {
-                provider_error = value
-                    .get("error")
-                    .and_then(|error| error.get("message"))
-                    .and_then(serde_json::Value::as_str)
-                    .map(ToOwned::to_owned)
-                    .or_else(|| Some(data.to_string()));
+                provider_error = stream_error_event_message(data);
             }
             _ => {}
         }
@@ -543,12 +559,9 @@ pub(crate) fn raw_choices_from_sse_body(
                 }
             }
             Some("error") => {
-                let message = value
-                    .get("error")
-                    .and_then(|error| error.get("message"))
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or(data);
-                return Err(CompletionError::ProviderError(message.to_owned()));
+                return Err(CompletionError::ProviderError(
+                    stream_error_event_message(data).unwrap_or_else(|| data.to_owned()),
+                ));
             }
             _ => {}
         }
@@ -657,6 +670,7 @@ where
 {
     let stream = stream! {
         let mut accumulator = RawChoiceAccumulator::new(ResponsesUsage::new());
+        let mut diagnostics = StreamDiagnostics::default();
         let span = tracing::Span::current();
 
         let mut terminated_with_error = false;
@@ -671,6 +685,7 @@ where
                     if evt.data.trim().is_empty() || evt.data == "[DONE]" {
                         continue;
                     }
+                    diagnostics.observe(&evt.data);
 
                     let data = serde_json::from_str::<StreamingCompletionChunk>(&evt.data);
 
@@ -678,6 +693,14 @@ where
                         let Err(err) = data else {
                             continue;
                         };
+                        if let Some(message) = stream_error_event_message(&evt.data) {
+                            let error = CompletionError::ProviderError(message);
+                            diagnostics.log_failure(provider_name, &error);
+                            terminated_with_error = true;
+                            yield Err(error);
+                            break;
+                        }
+                        diagnostics.undecodable();
                         debug!(
                             "Couldn't deserialize SSE data as StreamingCompletionChunk: {:?}",
                             err
@@ -693,13 +716,17 @@ where
                         }
                         StreamingCompletionChunk::Response(chunk) => {
                             let ResponseChunk { kind, response, .. } = *chunk;
-                            if matches!(kind, ResponseChunkKind::ResponseCompleted) {
+                            if diagnostics.response_id(&response.id) {
                                 span.record("gen_ai.response.id", response.id.as_str());
+                            }
+                            if matches!(kind, ResponseChunkKind::ResponseCompleted) {
+                                diagnostics.mark_completed();
                                 span.record("gen_ai.response.model", response.model.as_str());
                             }
                             if let Err(error) =
                                 accumulator.record_response_chunk(kind, response, provider_name, options)
                             {
+                                diagnostics.log_failure(provider_name, &error);
                                 terminated_with_error = true;
                                 yield Err(error);
                                 break;
@@ -711,7 +738,7 @@ where
                     event_source.close();
                 }
                 Err(error) => {
-                    tracing::error!(?error, "SSE error");
+                    diagnostics.log_failure(provider_name, &format_args!("{error:?}"));
                     terminated_with_error = true;
                     yield Err(CompletionError::HttpError(error));
                     break;
@@ -724,6 +751,7 @@ where
         if terminated_with_error {
             return;
         }
+        diagnostics.log_end(provider_name);
 
         let final_usage = accumulator.final_usage.clone();
 
@@ -933,6 +961,7 @@ where
     }
 }
 
+mod diagnostics;
 #[cfg(test)]
 mod tool_delta_tests;
 
@@ -949,6 +978,7 @@ mod tests {
     };
     use crate::streaming::{RawStreamingChoice, StreamedAssistantContent};
     use crate::test_utils::MockStreamingClient;
+    use crate::test_utils::log_capture::CapturedLogs;
     use futures::StreamExt;
     use serde_json::{self, json};
 
@@ -1384,26 +1414,6 @@ mod tests {
 
     #[tokio::test]
     async fn done_sentinel_is_ignored_without_debug_parse_noise() {
-        use std::io::{self, Write};
-        use std::sync::{Arc, Mutex};
-
-        #[derive(Clone)]
-        struct SharedWriter(Arc<Mutex<Vec<u8>>>);
-
-        impl Write for SharedWriter {
-            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                self.0
-                    .lock()
-                    .expect("log buffer mutex should not be poisoned")
-                    .extend_from_slice(buf);
-                Ok(buf.len())
-            }
-
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-
         let mut response = sample_response(ResponseStatus::Completed);
         response.usage = Some(ResponsesUsage {
             input_tokens: 4,
@@ -1415,17 +1425,7 @@ mod tests {
             total_tokens: 6,
         });
 
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
-            .with_ansi(false)
-            .without_time()
-            .with_writer({
-                let captured = captured.clone();
-                move || SharedWriter(captured.clone())
-            })
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let logs = CapturedLogs::at(tracing::Level::DEBUG);
 
         let client = openai::Client::builder()
             .http_client(MockStreamingClient {
@@ -1460,13 +1460,7 @@ mod tests {
         assert_eq!(usage.output_tokens, 2);
         assert_eq!(usage.total_tokens, 6);
 
-        let logs = String::from_utf8(
-            captured
-                .lock()
-                .expect("log buffer mutex should not be poisoned")
-                .clone(),
-        )
-        .expect("captured logs should be valid UTF-8");
+        let logs = logs.text();
         assert!(
             !logs.contains("Couldn't deserialize SSE data as StreamingCompletionChunk"),
             "expected [DONE] to bypass the parse-failure debug path, logs were: {logs}"

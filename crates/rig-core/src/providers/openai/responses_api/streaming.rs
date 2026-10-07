@@ -148,7 +148,10 @@ fn stream_error_event_message(data: &str) -> Option<String> {
     if value.get("type").and_then(serde_json::Value::as_str) != Some("error") {
         return None;
     }
-    let body = value.get("error").unwrap_or(&value);
+    let body = value
+        .get("error")
+        .filter(|error| error.is_object())
+        .unwrap_or(&value);
     let text = |key| body.get(key).and_then(serde_json::Value::as_str);
     let message = text("message").unwrap_or(data);
     Some(match text("code").filter(|code| !code.is_empty()) {

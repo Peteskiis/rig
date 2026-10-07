@@ -140,6 +140,23 @@ fn response_chunk_error_message(
     }
 }
 
+/// Message of a top-level `{"type":"error"}` stream event, which matches no
+/// [`StreamingCompletionChunk`] shape. Streams carry `code`/`message` at the top
+/// level; buffered bodies nest them under `error`.
+fn stream_error_event_message(data: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(data).ok()?;
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("error") {
+        return None;
+    }
+    let body = value.get("error").unwrap_or(&value);
+    let text = |key| body.get(key).and_then(serde_json::Value::as_str);
+    let message = text("message").unwrap_or(data);
+    Some(match text("code").filter(|code| !code.is_empty()) {
+        Some(code) => format!("{code}: {message}"),
+        None => message.to_owned(),
+    })
+}
+
 fn response_error_message(error: Option<&super::ResponseError>, fallback: &str) -> String {
     if let Some(error) = error {
         if error.code.is_empty() {
@@ -249,12 +266,7 @@ pub(crate) fn parse_sse_completion_body(
                     .or_else(|| Some(data.to_string()));
             }
             Some("error") => {
-                provider_error = value
-                    .get("error")
-                    .and_then(|error| error.get("message"))
-                    .and_then(serde_json::Value::as_str)
-                    .map(ToOwned::to_owned)
-                    .or_else(|| Some(data.to_string()));
+                provider_error = stream_error_event_message(data);
             }
             _ => {}
         }
@@ -544,12 +556,9 @@ pub(crate) fn raw_choices_from_sse_body(
                 }
             }
             Some("error") => {
-                let message = value
-                    .get("error")
-                    .and_then(|error| error.get("message"))
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or(data);
-                return Err(CompletionError::ProviderError(message.to_owned()));
+                return Err(CompletionError::ProviderError(
+                    stream_error_event_message(data).unwrap_or_else(|| data.to_owned()),
+                ));
             }
             _ => {}
         }
@@ -681,6 +690,13 @@ where
                         let Err(err) = data else {
                             continue;
                         };
+                        if let Some(message) = stream_error_event_message(&evt.data) {
+                            let error = CompletionError::ProviderError(message);
+                            diagnostics.log_failure(provider_name, &error);
+                            terminated_with_error = true;
+                            yield Err(error);
+                            break;
+                        }
                         diagnostics.undecodable();
                         debug!(
                             "Couldn't deserialize SSE data as StreamingCompletionChunk: {:?}",
@@ -697,11 +713,11 @@ where
                         }
                         StreamingCompletionChunk::Response(chunk) => {
                             let ResponseChunk { kind, response, .. } = *chunk;
-                            let completed = matches!(kind, ResponseChunkKind::ResponseCompleted);
-                            if diagnostics.response(&response.id, completed) {
+                            if diagnostics.response_id(&response.id) {
                                 span.record("gen_ai.response.id", response.id.as_str());
                             }
-                            if completed {
+                            if matches!(kind, ResponseChunkKind::ResponseCompleted) {
+                                diagnostics.mark_completed();
                                 span.record("gen_ai.response.model", response.model.as_str());
                             }
                             if let Err(error) =

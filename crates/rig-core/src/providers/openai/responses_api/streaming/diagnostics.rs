@@ -59,15 +59,19 @@ impl StreamDiagnostics {
             .ok()
             .and_then(|event| event.kind)
             .unwrap_or(Cow::Borrowed(UNTYPED));
-        let key = if self.event_types.contains_key(kind.as_ref())
-            || self.event_types.len() < MAX_TRACKED_TYPES
-        {
-            kind.as_ref()
+        if let Some(count) = self.event_types.get_mut(kind.as_ref()) {
+            *count += 1;
         } else {
-            OVERFLOW_TYPE
-        };
-        *self.event_types.entry(key.to_owned()).or_default() += 1;
-        self.last_event_type = Some(kind.into_owned());
+            let key = if self.event_types.len() < MAX_TRACKED_TYPES {
+                kind.as_ref()
+            } else {
+                OVERFLOW_TYPE
+            };
+            *self.event_types.entry(key.to_owned()).or_default() += 1;
+        }
+        let last = self.last_event_type.get_or_insert_with(String::new);
+        last.clear();
+        last.push_str(&kind);
     }
 
     /// Count a payload that did not decode as any known stream chunk.
@@ -77,13 +81,16 @@ impl StreamDiagnostics {
 
     /// Record the upstream response identity. Returns `true` the first time an
     /// id is seen so the caller can stamp it on the span before completion.
-    pub(super) fn response(&mut self, id: &str, completed: bool) -> bool {
-        self.completed |= completed;
+    pub(super) fn response_id(&mut self, id: &str) -> bool {
         if self.response_id.is_some() {
             return false;
         }
         self.response_id = Some(id.to_owned());
         true
+    }
+
+    pub(super) fn mark_completed(&mut self) {
+        self.completed = true;
     }
 
     /// Log a stream that terminated with an error.
@@ -252,12 +259,99 @@ mod tests {
     }
 
     #[test]
-    fn first_response_id_wins_and_completion_is_sticky() {
+    fn first_response_id_wins() {
         let mut diagnostics = StreamDiagnostics::default();
-        assert!(diagnostics.response("resp_1", false));
-        assert!(!diagnostics.response("resp_2", true));
+        assert!(diagnostics.response_id("resp_1"));
+        assert!(!diagnostics.response_id("resp_2"));
 
         assert_eq!(diagnostics.response_id.as_deref(), Some("resp_1"));
-        assert!(diagnostics.completed);
+    }
+
+    fn completed(id: &str) -> serde_json::Value {
+        let mut event = created(id);
+        event["type"] = json!("response.completed");
+        event["response"]["status"] = json!("completed");
+        event
+    }
+
+    #[tokio::test]
+    async fn completed_stream_with_undecodable_events_warns() {
+        let logs = drain_logs(&[
+            created("resp_ok"),
+            json!({"type": "response.output_text.delta", "output_index": 0}),
+            completed("resp_ok"),
+        ])
+        .await;
+
+        assert!(
+            logs.contains("Responses stream contained undecodable events"),
+            "{logs}"
+        );
+        assert!(!logs.contains("without response.completed"), "{logs}");
+        assert!(logs.contains("undecodable=1"), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn clean_stream_logs_nothing() {
+        assert_eq!(
+            drain_logs(&[created("resp_ok"), completed("resp_ok")]).await,
+            ""
+        );
+    }
+
+    #[tokio::test]
+    async fn error_event_fails_the_stream_with_its_message() {
+        let logs = CapturedLogs::at(tracing::Level::WARN);
+        let client = openai::Client::builder()
+            .http_client(MockStreamingClient {
+                sse_bytes: sse_bytes_from_json_events(&[
+                    created("resp_err"),
+                    json!({
+                        "type": "error", "code": "server_error",
+                        "message": "upstream overloaded", "param": null,
+                        "sequence_number": 1,
+                    }),
+                ]),
+            })
+            .api_key("test-key")
+            .build()
+            .expect("client should build");
+        let model = client.completion_model("gpt-5.4");
+        let request = model.completion_request("hello").build();
+        let mut stream = model.stream(request).await.expect("stream should start");
+
+        let error = loop {
+            match stream.next().await.expect("stream should yield an error") {
+                Ok(_) => continue,
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(
+            error.to_string(),
+            "ProviderError: server_error: upstream overloaded"
+        );
+        assert!(stream.next().await.is_none());
+        let logs = logs.text();
+        assert!(logs.contains("Responses stream failed"), "{logs}");
+        assert!(logs.contains("response_id=\"resp_err\""), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn transport_error_logs_the_failure_summary() {
+        let logs = CapturedLogs::at(tracing::Level::WARN);
+        let client = openai::Client::builder()
+            .http_client(crate::test_utils::RecordingHttpClient::default())
+            .api_key("test-key")
+            .build()
+            .expect("client should build");
+        let model = client.completion_model("gpt-5.4");
+        let request = model.completion_request("hello").build();
+        let mut stream = model.stream(request).await.expect("stream should start");
+        while stream.next().await.is_some() {}
+
+        let logs = logs.text();
+        assert!(logs.contains("Responses stream failed"), "{logs}");
+        assert!(logs.contains("InvalidStatusCode"), "{logs}");
+        assert!(logs.contains("events=0"), "{logs}");
     }
 }

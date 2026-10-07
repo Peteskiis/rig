@@ -197,7 +197,13 @@ impl CompatibleStreamProfile for OpenRouterCompatibleProfile {
         let data = match serde_json::from_str::<StreamingCompletionChunk>(data) {
             Ok(data) => data,
             Err(error) => {
-                tracing::error!(?error, message = data, "Failed to parse SSE message");
+                // The payload is model output; log its shape, never its content.
+                tracing::error!(
+                    category = ?error.classify(),
+                    column = error.column(),
+                    data_bytes = data.len(),
+                    "Failed to parse SSE message"
+                );
                 return Ok(None);
             }
         };

@@ -16,6 +16,23 @@ const MAX_TRACKED_TYPES: usize = 32;
 const OVERFLOW_TYPE: &str = "other";
 const UNTYPED: &str = "untyped";
 
+macro_rules! log_stream {
+    ($level:expr, $diagnostics:expr, $provider:expr, $message:literal $(, $($extra:tt)+)?) => {
+        tracing::event!(
+            $level,
+            provider = $provider,
+            response_id = $diagnostics.response_id.as_deref(),
+            events = $diagnostics.events,
+            data_bytes = $diagnostics.data_bytes,
+            last_event_type = $diagnostics.last_event_type.as_deref(),
+            event_types = %EventTypes(&$diagnostics.event_types),
+            undecodable = $diagnostics.undecodable,
+            $($($extra)+,)?
+            $message
+        )
+    };
+}
+
 #[derive(Debug, Default)]
 pub(super) struct StreamDiagnostics {
     response_id: Option<String>,
@@ -71,39 +88,29 @@ impl StreamDiagnostics {
 
     /// Log a stream that terminated with an error.
     pub(super) fn log_failure(&self, provider: &str, error: &dyn fmt::Display) {
-        tracing::error!(
+        log_stream!(
+            tracing::Level::ERROR,
+            self,
             provider,
-            error = %error,
-            response_id = self.response_id.as_deref(),
-            events = self.events,
-            data_bytes = self.data_bytes,
-            last_event_type = self.last_event_type.as_deref(),
-            event_types = %EventTypes(&self.event_types),
-            undecodable = self.undecodable,
-            "Responses stream failed"
+            "Responses stream failed",
+            error = %error
         );
     }
 
     /// Log anomalies of a stream that ended without an error.
     pub(super) fn log_end(&self, provider: &str) {
         if !self.completed {
-            tracing::warn!(
+            log_stream!(
+                tracing::Level::WARN,
+                self,
                 provider,
-                response_id = self.response_id.as_deref(),
-                events = self.events,
-                data_bytes = self.data_bytes,
-                last_event_type = self.last_event_type.as_deref(),
-                event_types = %EventTypes(&self.event_types),
-                undecodable = self.undecodable,
                 "Responses stream ended without response.completed"
             );
         } else if self.undecodable > 0 {
-            tracing::warn!(
+            log_stream!(
+                tracing::Level::WARN,
+                self,
                 provider,
-                response_id = self.response_id.as_deref(),
-                events = self.events,
-                event_types = %EventTypes(&self.event_types),
-                undecodable = self.undecodable,
                 "Responses stream contained undecodable events"
             );
         }
@@ -126,9 +133,6 @@ impl fmt::Display for EventTypes<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{self, Write};
-    use std::sync::{Arc, Mutex};
-
     use futures::StreamExt;
     use serde_json::json;
 
@@ -138,6 +142,7 @@ mod tests {
     use crate::providers::internal::openai_chat_completions_compatible::test_support::sse_bytes_from_json_events;
     use crate::providers::openai;
     use crate::test_utils::MockStreamingClient;
+    use crate::test_utils::log_capture::CapturedLogs;
 
     #[test]
     fn tallies_event_types_and_bytes() {
@@ -173,36 +178,9 @@ mod tests {
         );
     }
 
-    #[derive(Clone)]
-    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
-
-    impl Write for SharedWriter {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0
-                .lock()
-                .expect("log buffer mutex should not be poisoned")
-                .extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
     /// Drain a mock Responses stream and return what it logged.
     async fn drain_logs(events: &[serde_json::Value]) -> String {
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .without_time()
-            .with_writer({
-                let captured = captured.clone();
-                move || SharedWriter(captured.clone())
-            })
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let logs = CapturedLogs::at(tracing::Level::WARN);
 
         let client = openai::Client::builder()
             .http_client(MockStreamingClient {
@@ -216,11 +194,7 @@ mod tests {
         let mut stream = model.stream(request).await.expect("stream should start");
         while stream.next().await.is_some() {}
 
-        let logs = captured
-            .lock()
-            .expect("log buffer mutex should not be poisoned")
-            .clone();
-        String::from_utf8(logs).expect("captured logs should be valid UTF-8")
+        logs.text()
     }
 
     fn created(id: &str) -> serde_json::Value {

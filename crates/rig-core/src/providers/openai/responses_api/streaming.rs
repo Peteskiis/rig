@@ -959,6 +959,7 @@ mod tests {
     };
     use crate::streaming::{RawStreamingChoice, StreamedAssistantContent};
     use crate::test_utils::MockStreamingClient;
+    use crate::test_utils::log_capture::CapturedLogs;
     use futures::StreamExt;
     use serde_json::{self, json};
 
@@ -1394,26 +1395,6 @@ mod tests {
 
     #[tokio::test]
     async fn done_sentinel_is_ignored_without_debug_parse_noise() {
-        use std::io::{self, Write};
-        use std::sync::{Arc, Mutex};
-
-        #[derive(Clone)]
-        struct SharedWriter(Arc<Mutex<Vec<u8>>>);
-
-        impl Write for SharedWriter {
-            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                self.0
-                    .lock()
-                    .expect("log buffer mutex should not be poisoned")
-                    .extend_from_slice(buf);
-                Ok(buf.len())
-            }
-
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-
         let mut response = sample_response(ResponseStatus::Completed);
         response.usage = Some(ResponsesUsage {
             input_tokens: 4,
@@ -1425,17 +1406,7 @@ mod tests {
             total_tokens: 6,
         });
 
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
-            .with_ansi(false)
-            .without_time()
-            .with_writer({
-                let captured = captured.clone();
-                move || SharedWriter(captured.clone())
-            })
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let logs = CapturedLogs::at(tracing::Level::DEBUG);
 
         let client = openai::Client::builder()
             .http_client(MockStreamingClient {
@@ -1470,13 +1441,7 @@ mod tests {
         assert_eq!(usage.output_tokens, 2);
         assert_eq!(usage.total_tokens, 6);
 
-        let logs = String::from_utf8(
-            captured
-                .lock()
-                .expect("log buffer mutex should not be poisoned")
-                .clone(),
-        )
-        .expect("captured logs should be valid UTF-8");
+        let logs = logs.text();
         assert!(
             !logs.contains("Couldn't deserialize SSE data as StreamingCompletionChunk"),
             "expected [DONE] to bypass the parse-failure debug path, logs were: {logs}"

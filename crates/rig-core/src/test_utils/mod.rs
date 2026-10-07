@@ -5,6 +5,8 @@ mod embeddings;
 mod http;
 #[cfg(test)]
 pub(crate) mod internal_streaming_profiles;
+#[cfg(test)]
+pub(crate) mod log_capture;
 mod memory;
 mod model_listing;
 mod pipeline;

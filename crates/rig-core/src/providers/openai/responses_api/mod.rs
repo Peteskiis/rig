@@ -568,16 +568,15 @@ pub struct ResponsesToolDefinition {
     /// Tool name
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
-    /// Parameters - this should be a JSON schema. Tools should additionally ensure an "additionalParameters" field has been added with the value set to false, as this is required if using OpenAI's strict mode (enabled by default).
+    /// Function parameters as JSON Schema. Strict schemas require
+    /// `additionalProperties: false` on every object.
     #[serde(default, skip_serializing_if = "is_json_null")]
     pub parameters: serde_json::Value,
-    /// Whether to use strict mode. Enabled by default as it allows for improved efficiency.
-    #[serde(
-        default,
-        deserialize_with = "default_on_null",
-        skip_serializing_if = "is_false"
-    )]
-    pub strict: bool,
+    /// Function schema validation mode. `Some(false)` must be sent explicitly:
+    /// omission lets Responses normalize optional parameters into required ones.
+    /// Hosted tools leave this unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
     /// Tool description.
     #[serde(
         default,
@@ -604,10 +603,6 @@ fn is_json_null(value: &Value) -> bool {
     value.is_null()
 }
 
-fn is_false(value: &bool) -> bool {
-    !value
-}
-
 impl ResponsesToolDefinition {
     /// Creates a function tool definition (strict mode).
     pub fn function(
@@ -621,7 +616,7 @@ impl ResponsesToolDefinition {
             kind: "function".to_string(),
             name: name.into(),
             parameters,
-            strict: true,
+            strict: Some(true),
             description: description.into(),
             config: Map::new(),
         }
@@ -633,12 +628,10 @@ impl ResponsesToolDefinition {
     /// client wants OpenAI strict tool calling, and forcing it (via
     /// `sanitize_schema`'s `required` = all-properties + `additionalProperties:
     /// false` rewrites) makes OpenAI 400 any valid-but-non-strict schema (open
-    /// maps, property-less objects). `strict: false` + the lenient sanitize let
-    /// OpenAI's non-strict validation accept those. (`strict: false` is omitted
-    /// on the wire via the field's `skip_serializing_if = "is_false"`, so
-    /// acceptance rides on OpenAI's documented omitted-strict fallback — flip the
-    /// serde attr if that fallback ever changes.) Crate-internal: the only caller
-    /// is the `From<ToolDefinition>` impl below.
+    /// maps, property-less objects). Explicit `strict: false` preserves the
+    /// supplied optional fields instead of allowing Responses to normalize them
+    /// into required fields. Crate-internal: the only caller is the
+    /// `From<ToolDefinition>` impl below.
     pub(crate) fn function_lenient(
         name: impl Into<String>,
         description: impl Into<String>,
@@ -650,7 +643,7 @@ impl ResponsesToolDefinition {
             kind: "function".to_string(),
             name: name.into(),
             parameters,
-            strict: false,
+            strict: Some(false),
             description: description.into(),
             config: Map::new(),
         }
@@ -662,7 +655,7 @@ impl ResponsesToolDefinition {
             kind: kind.into(),
             name: String::new(),
             parameters: Value::Null,
-            strict: false,
+            strict: None,
             description: String::new(),
             config: Map::new(),
         }
@@ -692,7 +685,7 @@ impl ResponsesToolDefinition {
     fn normalize(mut self) -> Self {
         if self.kind == "function" {
             super::sanitize_schema(&mut self.parameters);
-            self.strict = true;
+            self.strict = Some(true);
         }
         self
     }
@@ -2010,7 +2003,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn response_tool_optional_fields_accept_null_without_changing_request_serialization() {
+    fn response_tool_optional_fields_preserve_explicit_false_and_accept_null() {
         for extras in [
             json!({}),
             json!({"strict":null, "description":null}),
@@ -2018,13 +2011,17 @@ mod tests {
         ] {
             let value =
                 crate::json_utils::merge(json!({"type":"function", "name":"weather"}), extras);
+            let expected_strict = value
+                .get("strict")
+                .filter(|value| !value.is_null())
+                .cloned();
             let tool: ResponsesToolDefinition = serde_json::from_value(value)
                 .unwrap_or_else(|error| panic!("tool fixture: {error}"));
-            assert!(!tool.strict);
+            assert_ne!(tool.strict, Some(true));
             assert!(tool.description.is_empty());
             let wire = serde_json::to_value(tool)
                 .unwrap_or_else(|error| panic!("tool serialization: {error}"));
-            assert!(wire.get("strict").is_none());
+            assert_eq!(wire.get("strict"), expected_strict.as_ref());
             assert!(wire.get("description").is_none());
         }
         let tool: ResponsesToolDefinition = serde_json::from_value(json!({
@@ -2066,12 +2063,8 @@ mod tests {
 
         let responses_tool: ResponsesToolDefinition = tool.into();
 
-        // 1) Non-strict — OpenAI's lenient validation applies (and `strict: false`
-        //    is omitted on the wire via the struct's `skip_serializing_if`).
-        assert!(
-            !responses_tool.strict,
-            "proxied tools must not force strict mode"
-        );
+        // Explicit false prevents provider-side strict normalization.
+        assert_eq!(responses_tool.strict, Some(false));
         // 2) The open map survived (lenient sanitize didn't clobber it).
         assert_eq!(
             responses_tool.parameters["properties"]["data"]["additionalProperties"],
@@ -2079,6 +2072,48 @@ mod tests {
         );
         // 3) `required` was NOT rewritten to every key — `data` stays optional.
         assert_eq!(responses_tool.parameters["required"], json!(["target"]));
+    }
+
+    #[test]
+    fn hosted_tools_do_not_send_function_strict_configuration() {
+        let wire = serde_json::to_value(ResponsesToolDefinition::web_search())
+            .expect("hosted tool serialization");
+        assert!(wire.get("strict").is_none());
+        let wire = serde_json::to_value(ResponsesToolDefinition::function(
+            "weather",
+            "Weather lookup",
+            json!({"type":"object", "properties":{}}),
+        ))
+        .expect("strict function serialization");
+        assert_eq!(wire["strict"], true);
+    }
+
+    #[test]
+    fn optional_function_parameters_remain_optional_on_the_wire() {
+        let tool: ResponsesToolDefinition = completion::ToolDefinition {
+            name: "web_search".into(),
+            description: "Search; omit visual_subject for how-to questions.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "queries": {"type": "array", "items": {"type": "string"}},
+                    "visual_subject": {"type": "string"}
+                },
+                "required": ["queries"],
+                "additionalProperties": false
+            }),
+        }
+        .into();
+        let wire = serde_json::to_value(tool).expect("function tool serialization");
+        assert_eq!(
+            wire["strict"], false,
+            "omitting false permits provider strict normalization"
+        );
+        assert_eq!(wire["parameters"]["required"], json!(["queries"]));
+        assert_eq!(
+            wire["parameters"]["properties"]["visual_subject"]["type"],
+            "string"
+        );
     }
 
     #[test]

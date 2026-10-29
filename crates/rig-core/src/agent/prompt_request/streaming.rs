@@ -669,6 +669,7 @@ where
                                     rig::streaming::ToolCallDeltaContent::Delta(d) => {
                                         (None, d.as_str())
                                     }
+                                    rig::streaming::ToolCallDeltaContent::Complete { .. } => continue,
                                 };
 
                                 if let HookAction::Terminate { reason } = hook.on_tool_call_delta(&id, &internal_call_id, name, delta)

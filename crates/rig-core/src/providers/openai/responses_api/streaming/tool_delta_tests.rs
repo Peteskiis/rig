@@ -164,7 +164,22 @@ async fn verify_live_argument_deltas() {
     let arguments = fragments.concat();
     for index in 0..2 {
         send(&sender, argument_done(index, &arguments)).await;
+        let event = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("arguments.done must complete input while output item is still open")
+            .expect("input completion")
+            .expect("valid completion");
+        assert!(matches!(event, StreamedAssistantContent::ToolCallDelta {
+            internal_call_id, content: ToolCallDeltaContent::Complete { input_bytes }, ..
+        } if internal_call_id == internal_ids[&index] && input_bytes == arguments.len()));
+    }
+    for index in 0..2 {
         send(&sender, item(index, true, &arguments)).await;
+        assert!(
+            matches!(stream.next().await, Some(Ok(StreamedAssistantContent::ToolCallDelta {
+            internal_call_id, content: ToolCallDeltaContent::Complete { input_bytes }, ..
+        })) if internal_call_id == internal_ids[&index] && input_bytes == arguments.len())
+        );
     }
     send(
         &sender,
@@ -210,4 +225,36 @@ impl Drop for ServerGuard {
     fn drop(&mut self) {
         self.0.abort();
     }
+}
+
+#[test]
+fn completed_input_is_observable_before_response_end() {
+    let mut accumulator = super::RawChoiceAccumulator::new(super::ResponsesUsage::new());
+    let chunk: super::StreamingCompletionChunk = serde_json::from_value(serde_json::json!({
+        "type": "response.output_item.done",
+        "sequence_number": 1,
+        "output_index": 0,
+        "item": {
+            "type": "function_call", "id": "fc_complete", "call_id": "call_complete",
+            "name": "web_search", "arguments": "{}", "status": "completed"
+        }
+    }))
+    .unwrap();
+    let super::StreamingCompletionChunk::Delta(chunk) = chunk else {
+        panic!("item event")
+    };
+    let immediate =
+        accumulator.decode_item_chunk(chunk.data, super::ResponsesStreamOptions::strict());
+    assert_eq!(
+        immediate.len(),
+        1,
+        "input completion must be visible before the response ends"
+    );
+    assert!(
+        !matches!(
+            immediate[0],
+            rig::streaming::RawStreamingChoice::ToolCall(_)
+        ),
+        "input completion must not authorize execution before response success"
+    );
 }

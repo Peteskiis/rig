@@ -301,6 +301,13 @@ impl RawChoiceAccumulator {
         }
     }
 
+    fn internal_call_id(&mut self, item_id: &str) -> String {
+        self.tool_call_internal_ids
+            .entry(item_id.to_owned())
+            .or_insert_with(|| nanoid::nanoid!())
+            .clone()
+    }
+
     fn decode_item_chunk(
         &mut self,
         item: ItemChunkKind,
@@ -313,11 +320,7 @@ impl RawChoiceAccumulator {
                 item: Output::FunctionCall(func),
                 ..
             }) => {
-                let internal_call_id = self
-                    .tool_call_internal_ids
-                    .entry(func.id.clone())
-                    .or_insert_with(|| nanoid::nanoid!())
-                    .clone();
+                let internal_call_id = self.internal_call_id(&func.id);
                 immediate.push(streaming::RawStreamingChoice::ToolCallDelta {
                     id: func.id,
                     internal_call_id,
@@ -343,12 +346,20 @@ impl RawChoiceAccumulator {
             ItemChunkKind::RefusalDelta(delta) => {
                 immediate.push(streaming::RawStreamingChoice::Message(delta.delta));
             }
+            ItemChunkKind::FunctionCallArgsDone(done) => {
+                let internal_call_id = self.internal_call_id(&done.item_id);
+                // Input completion is not permission to execute: strict Responses
+                // calls remain buffered until the response finishes successfully.
+                immediate.push(streaming::RawStreamingChoice::ToolCallDelta {
+                    id: done.item_id,
+                    internal_call_id,
+                    content: streaming::ToolCallDeltaContent::Complete {
+                        input_bytes: done.arguments.len(),
+                    },
+                });
+            }
             ItemChunkKind::FunctionCallArgsDelta(delta) => {
-                let internal_call_id = self
-                    .tool_call_internal_ids
-                    .entry(delta.item_id.clone())
-                    .or_insert_with(|| nanoid::nanoid!())
-                    .clone();
+                let internal_call_id = self.internal_call_id(&delta.item_id);
                 immediate.push(streaming::RawStreamingChoice::ToolCallDelta {
                     id: delta.item_id,
                     internal_call_id,
@@ -400,11 +411,19 @@ impl RawChoiceAccumulator {
     ) {
         match item {
             Output::FunctionCall(func) => {
-                let internal_call_id = self
-                    .tool_call_internal_ids
-                    .entry(func.id.clone())
-                    .or_insert_with(|| nanoid::nanoid!())
-                    .clone();
+                let internal_call_id = self.internal_call_id(&func.id);
+                if !emit_completed_tool_calls_immediately {
+                    // Completion is observable even when executable calls are held
+                    // until response success. Consumers can stop input-generation
+                    // deadlines without dispatching a call from a failed response.
+                    immediate.push(streaming::RawStreamingChoice::ToolCallDelta {
+                        id: func.id.clone(),
+                        internal_call_id: internal_call_id.clone(),
+                        content: streaming::ToolCallDeltaContent::Complete {
+                            input_bytes: func.arguments.to_string().len(),
+                        },
+                    });
+                }
                 let tool_call =
                     streaming::RawStreamingToolCall::new(func.id, func.name, func.arguments)
                         .with_internal_call_id(internal_call_id)
@@ -670,7 +689,7 @@ where
 {
     let stream = stream! {
         let mut accumulator = RawChoiceAccumulator::new(ResponsesUsage::new());
-        let mut diagnostics = StreamDiagnostics::default();
+        let mut diagnostics = StreamDiagnostics::new(provider_name);
         let span = tracing::Span::current();
 
         let mut terminated_with_error = false;
@@ -695,7 +714,7 @@ where
                         };
                         if let Some(message) = stream_error_event_message(&evt.data) {
                             let error = CompletionError::ProviderError(message);
-                            diagnostics.log_failure(provider_name, &error);
+                            diagnostics.log_failure(&error);
                             terminated_with_error = true;
                             yield Err(error);
                             break;
@@ -726,7 +745,7 @@ where
                             if let Err(error) =
                                 accumulator.record_response_chunk(kind, response, provider_name, options)
                             {
-                                diagnostics.log_failure(provider_name, &error);
+                                diagnostics.log_failure(&error);
                                 terminated_with_error = true;
                                 yield Err(error);
                                 break;
@@ -738,7 +757,7 @@ where
                     event_source.close();
                 }
                 Err(error) => {
-                    diagnostics.log_failure(provider_name, &format_args!("{error:?}"));
+                    diagnostics.log_failure(&format_args!("{error:?}"));
                     terminated_with_error = true;
                     yield Err(CompletionError::HttpError(error));
                     break;
@@ -751,7 +770,7 @@ where
         if terminated_with_error {
             return;
         }
-        diagnostics.log_end(provider_name);
+        diagnostics.log_end();
 
         let final_usage = accumulator.final_usage.clone();
 
@@ -1339,6 +1358,7 @@ mod tests {
         let tool_call_done = json!({
             "type": "response.output_item.done",
             "sequence_number": 1,
+            "output_index": 0,
             "item": {
                 "type": "function_call",
                 "id": "fc_123",
@@ -1372,6 +1392,13 @@ mod tests {
         let request = model.completion_request("hello").build();
         let mut stream = model.stream(request).await.expect("stream should start");
 
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(StreamedAssistantContent::ToolCallDelta {
+                content: crate::streaming::ToolCallDeltaContent::Complete { input_bytes: 2 },
+                ..
+            }))
+        ));
         let err = stream
             .next()
             .await

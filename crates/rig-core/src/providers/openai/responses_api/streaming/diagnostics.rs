@@ -33,8 +33,10 @@ macro_rules! log_stream {
     };
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct StreamDiagnostics {
+    provider: &'static str,
+    terminal_reported: bool,
     response_id: Option<String>,
     completed: bool,
     events: u64,
@@ -51,6 +53,20 @@ struct EventType<'a> {
 }
 
 impl StreamDiagnostics {
+    pub(super) fn new(provider: &'static str) -> Self {
+        Self {
+            provider,
+            terminal_reported: false,
+            response_id: None,
+            completed: false,
+            events: 0,
+            data_bytes: 0,
+            event_types: BTreeMap::new(),
+            last_event_type: None,
+            undecodable: 0,
+        }
+    }
+
     /// Tally one non-empty SSE data payload by its JSON `type`.
     pub(super) fn observe(&mut self, data: &str) {
         self.events += 1;
@@ -94,31 +110,47 @@ impl StreamDiagnostics {
     }
 
     /// Log a stream that terminated with an error.
-    pub(super) fn log_failure(&self, provider: &str, error: &dyn fmt::Display) {
+    pub(super) fn log_failure(&mut self, error: &dyn fmt::Display) {
+        self.terminal_reported = true;
         log_stream!(
             tracing::Level::ERROR,
             self,
-            provider,
+            self.provider,
             "Responses stream failed",
             error = %error
         );
     }
 
     /// Log anomalies of a stream that ended without an error.
-    pub(super) fn log_end(&self, provider: &str) {
+    pub(super) fn log_end(&mut self) {
+        self.terminal_reported = true;
         if !self.completed {
             log_stream!(
                 tracing::Level::WARN,
                 self,
-                provider,
+                self.provider,
                 "Responses stream ended without response.completed"
             );
         } else if self.undecodable > 0 {
             log_stream!(
                 tracing::Level::WARN,
                 self,
-                provider,
+                self.provider,
                 "Responses stream contained undecodable events"
+            );
+        }
+    }
+}
+
+impl Drop for StreamDiagnostics {
+    fn drop(&mut self) {
+        if !self.terminal_reported {
+            log_stream!(
+                tracing::Level::INFO,
+                self,
+                self.provider,
+                "Responses stream dropped before terminal delivery",
+                completed = self.completed
             );
         }
     }
@@ -151,9 +183,69 @@ mod tests {
     use crate::test_utils::MockStreamingClient;
     use crate::test_utils::log_capture::CapturedLogs;
 
+    #[tokio::test]
+    async fn cancellation_logs_counters_without_argument_payloads() {
+        let logs = CapturedLogs::at(tracing::Level::INFO);
+        let client = openai::Client::builder()
+            .http_client(MockStreamingClient {
+                sse_bytes: sse_bytes_from_json_events(&[
+                    created("resp_cancelled"),
+                    json!({"type":"response.function_call_arguments.delta",
+                        "output_index":0,"item_id":"fc_private","sequence_number":1,
+                        "delta":"private-argument-sentinel"}),
+                ]),
+            })
+            .api_key("private-credential-sentinel")
+            .build()
+            .unwrap();
+        let model = client.completion_model("gpt-5.4");
+        let mut stream = model
+            .stream(model.completion_request("private-prompt-sentinel").build())
+            .await
+            .unwrap();
+        assert!(stream.next().await.unwrap().is_ok());
+        drop(stream);
+        let logs = logs.text();
+        assert_eq!(
+            logs.matches("Responses stream dropped before terminal delivery")
+                .count(),
+            1,
+            "{logs}"
+        );
+        assert!(logs.contains("resp_cancelled"), "{logs}");
+        assert!(logs.contains("events=2"), "{logs}");
+        assert!(
+            logs.contains("response.function_call_arguments.delta=1"),
+            "{logs}"
+        );
+        assert!(logs.contains("completed=false"), "{logs}");
+        for secret in [
+            "private-argument-sentinel",
+            "private-credential-sentinel",
+            "private-prompt-sentinel",
+        ] {
+            assert!(!logs.contains(secret), "payload leaked");
+        }
+    }
+
+    #[test]
+    fn terminal_logging_suppresses_duplicate_drop_diagnostics() {
+        for failed in [false, true] {
+            let logs = CapturedLogs::at(tracing::Level::INFO);
+            let mut diagnostics = StreamDiagnostics::new("OpenAI");
+            if failed {
+                diagnostics.log_failure(&"test failure");
+            } else {
+                diagnostics.log_end();
+            }
+            drop(diagnostics);
+            assert!(!logs.text().contains("dropped before terminal delivery"));
+        }
+    }
+
     #[test]
     fn tallies_event_types_and_bytes() {
-        let mut diagnostics = StreamDiagnostics::default();
+        let mut diagnostics = StreamDiagnostics::new("OpenAI");
         diagnostics.observe(r#"{"type":"response.output_text.delta","delta":"a"}"#);
         diagnostics.observe(r#"{"type":"response.output_text.delta","delta":"b"}"#);
         diagnostics.observe(r#"{"delta":"no type"}"#);
@@ -169,7 +261,7 @@ mod tests {
 
     #[test]
     fn novel_types_beyond_the_cap_share_one_bucket() {
-        let mut diagnostics = StreamDiagnostics::default();
+        let mut diagnostics = StreamDiagnostics::new("OpenAI");
         for index in 0..MAX_TRACKED_TYPES + 3 {
             diagnostics.observe(&format!(r#"{{"type":"kind.{index}"}}"#));
         }
@@ -187,7 +279,7 @@ mod tests {
 
     /// Drain a mock Responses stream and return what it logged.
     async fn drain_logs(events: &[serde_json::Value]) -> String {
-        let logs = CapturedLogs::at(tracing::Level::WARN);
+        let logs = CapturedLogs::at(tracing::Level::INFO);
 
         let client = openai::Client::builder()
             .http_client(MockStreamingClient {
@@ -260,7 +352,7 @@ mod tests {
 
     #[test]
     fn first_response_id_wins() {
-        let mut diagnostics = StreamDiagnostics::default();
+        let mut diagnostics = StreamDiagnostics::new("OpenAI");
         assert!(diagnostics.response_id("resp_1"));
         assert!(!diagnostics.response_id("resp_2"));
 
@@ -301,7 +393,7 @@ mod tests {
 
     #[tokio::test]
     async fn error_event_fails_the_stream_with_its_message() {
-        let logs = CapturedLogs::at(tracing::Level::WARN);
+        let logs = CapturedLogs::at(tracing::Level::INFO);
         let client = openai::Client::builder()
             .http_client(MockStreamingClient {
                 sse_bytes: sse_bytes_from_json_events(&[
@@ -338,7 +430,7 @@ mod tests {
 
     #[tokio::test]
     async fn transport_error_logs_the_failure_summary() {
-        let logs = CapturedLogs::at(tracing::Level::WARN);
+        let logs = CapturedLogs::at(tracing::Level::INFO);
         let client = openai::Client::builder()
             .http_client(crate::test_utils::RecordingHttpClient::default())
             .api_key("test-key")

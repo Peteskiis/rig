@@ -67,13 +67,17 @@ impl Default for PauseControl {
     }
 }
 
-/// The content of a tool call delta - either the tool name or argument data
+/// Tool input generation progress, separate from authorization to execute the call.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub enum ToolCallDeltaContent {
     /// Tool/function name emitted by the provider.
     Name(String),
     /// Partial JSON argument data emitted by the provider.
     Delta(String),
+    /// The provider finished this input. `input_bytes` is its complete serialized
+    /// argument size, including inputs delivered without argument deltas.
+    /// This does not authorize execution: wait for `StreamedAssistantContent::ToolCall`.
+    Complete { input_bytes: usize },
 }
 
 /// Enum representing a streaming chunk from the model

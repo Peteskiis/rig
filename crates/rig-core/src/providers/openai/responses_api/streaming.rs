@@ -405,6 +405,18 @@ impl RawChoiceAccumulator {
                     .entry(func.id.clone())
                     .or_insert_with(|| nanoid::nanoid!())
                     .clone();
+                if !emit_completed_tool_calls_immediately {
+                    // Completion is observable even when executable calls are held
+                    // until response success. Consumers can stop input-generation
+                    // deadlines without dispatching a call from a failed response.
+                    immediate.push(streaming::RawStreamingChoice::ToolCallDelta {
+                        id: func.id.clone(),
+                        internal_call_id: internal_call_id.clone(),
+                        content: streaming::ToolCallDeltaContent::Complete {
+                            input_bytes: func.arguments.to_string().len(),
+                        },
+                    });
+                }
                 let tool_call =
                     streaming::RawStreamingToolCall::new(func.id, func.name, func.arguments)
                         .with_internal_call_id(internal_call_id)
@@ -1339,6 +1351,7 @@ mod tests {
         let tool_call_done = json!({
             "type": "response.output_item.done",
             "sequence_number": 1,
+            "output_index": 0,
             "item": {
                 "type": "function_call",
                 "id": "fc_123",
@@ -1372,6 +1385,13 @@ mod tests {
         let request = model.completion_request("hello").build();
         let mut stream = model.stream(request).await.expect("stream should start");
 
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(StreamedAssistantContent::ToolCallDelta {
+                content: crate::streaming::ToolCallDeltaContent::Complete { input_bytes: 2 },
+                ..
+            }))
+        ));
         let err = stream
             .next()
             .await

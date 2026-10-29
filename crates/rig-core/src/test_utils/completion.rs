@@ -408,6 +408,7 @@ mod tests {
                     ToolCallDeltaContent::Delta(arguments) => {
                         saw_arguments_delta = arguments == "{\"x\":1}";
                     }
+                    ToolCallDeltaContent::Complete { .. } => {}
                 },
                 StreamedAssistantContent::ToolCall { tool_call, .. } => {
                     saw_tool_call = tool_call.call_id.as_deref() == Some("call_1");

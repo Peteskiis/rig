@@ -164,15 +164,22 @@ async fn verify_live_argument_deltas() {
     let arguments = fragments.concat();
     for index in 0..2 {
         send(&sender, argument_done(index, &arguments)).await;
-        send(&sender, item(index, true, &arguments)).await;
-        let event = stream
-            .next()
+        let event = tokio::time::timeout(Duration::from_secs(2), stream.next())
             .await
+            .expect("arguments.done must complete input while output item is still open")
             .expect("input completion")
             .expect("valid completion");
         assert!(matches!(event, StreamedAssistantContent::ToolCallDelta {
             internal_call_id, content: ToolCallDeltaContent::Complete { input_bytes }, ..
         } if internal_call_id == internal_ids[&index] && input_bytes == arguments.len()));
+    }
+    for index in 0..2 {
+        send(&sender, item(index, true, &arguments)).await;
+        assert!(
+            matches!(stream.next().await, Some(Ok(StreamedAssistantContent::ToolCallDelta {
+            internal_call_id, content: ToolCallDeltaContent::Complete { input_bytes }, ..
+        })) if internal_call_id == internal_ids[&index] && input_bytes == arguments.len())
+        );
     }
     send(
         &sender,

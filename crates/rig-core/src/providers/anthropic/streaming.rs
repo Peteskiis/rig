@@ -314,6 +314,7 @@ where
             let mut current_thinking: Option<ThinkingState> = None;
             let mut sse_stream = Box::pin(stream);
             let mut input_tokens = 0;
+            let mut speed = None;
             let mut final_usage = None;
             let mut stop_reason = None;
 
@@ -329,6 +330,7 @@ where
                                 match &event {
                                     StreamingEvent::MessageStart { message } => {
                                         input_tokens = message.usage.input_tokens;
+                                        speed = message.usage.speed.clone();
 
                                         let span = tracing::Span::current();
                                         span.record("gen_ai.response.id", &message.id);
@@ -344,7 +346,9 @@ where
                                                  input_tokens: usize::try_from(input_tokens).ok(),
                                                  cache_creation_input_tokens: usage.cache_creation_input_tokens,
                                                  cache_read_input_tokens: usage.cache_read_input_tokens,
-                                                 speed: usage.speed.clone(),
+                                                 // Speed is message metadata: Anthropic may send it
+                                                 // only in message_start, unlike cumulative tokens.
+                                                 speed: usage.speed.clone().or_else(|| speed.clone()),
                                             };
 
                                             let span = tracing::Span::current();
@@ -609,9 +613,14 @@ mod tests {
     }
 
     async fn final_response_from_terminal(
+        start_speed: Option<&str>,
         speed: Option<&str>,
         stop_reason: &str,
     ) -> StreamingCompletionResponse {
+        let mut initial_usage = json!({ "input_tokens": 3, "output_tokens": 0 });
+        if let Some(speed) = start_speed {
+            initial_usage["speed"] = json!(speed);
+        }
         let mut terminal_usage = json!({ "output_tokens": 2 });
         if let Some(speed) = speed {
             terminal_usage["speed"] = json!(speed);
@@ -626,7 +635,7 @@ mod tests {
                     "model": CLAUDE_SONNET_4_6,
                     "stop_reason": null,
                     "stop_sequence": null,
-                    "usage": { "input_tokens": 3, "output_tokens": 0 },
+                    "usage": initial_usage,
                 },
             }),
             json!({
@@ -666,16 +675,33 @@ mod tests {
         ];
 
         for (speed, expected) in cases {
-            let response = final_response_from_terminal(speed, "end_turn").await;
+            let response = final_response_from_terminal(None, speed, "end_turn").await;
 
             assert_eq!(response.service_tier(), expected, "{speed:?}");
         }
     }
 
     #[tokio::test]
+    async fn message_start_speed_survives_a_terminal_usage_without_speed() {
+        for (start, terminal, expected) in [
+            ("fast", None, Some(ServiceTier::Fast)),
+            ("standard", None, Some(ServiceTier::Standard)),
+            ("experimental", None, None),
+            ("fast", Some("standard"), Some(ServiceTier::Standard)),
+            ("fast", Some("experimental"), None),
+        ] {
+            let response = final_response_from_terminal(Some(start), terminal, "end_turn").await;
+            assert_eq!(response.service_tier(), expected, "{start}/{terminal:?}");
+            let usage = response.token_usage().expect("terminal usage");
+            assert_eq!(usage.input_tokens, 3);
+            assert_eq!(usage.output_tokens, 2);
+        }
+    }
+
+    #[tokio::test]
     async fn terminal_message_delta_preserves_stop_reason_and_usage() {
         for reason in ["refusal", "max_tokens", "tool_use", "end_turn"] {
-            let response = final_response_from_terminal(None, reason).await;
+            let response = final_response_from_terminal(None, None, reason).await;
             let encoded = serde_json::to_value(&response).expect("serializable response");
             assert_eq!(encoded["stop_reason"], reason);
             let usage = response.token_usage().expect("terminal usage");

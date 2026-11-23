@@ -123,10 +123,13 @@ wasm = [
 ]
 rmcp = ["dep:rmcp"]
 socks = ["reqwest/socks"]
+# No `reqwest/system-proxy`: on macOS it makes every `Client` build ask the
+# system for proxy settings, which lists the directory holding the executable.
+# For a test binary that is `target/debug/deps`, and with one process per test
+# the lookups queue for seconds. Proxies still come from the environment.
 reqwest = [
   "reqwest/charset",
   "reqwest/http2",
-  "reqwest/system-proxy",
 ]
 websocket = ["websocket-rustls"]
 websocket-rustls = [
